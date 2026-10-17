@@ -1,9 +1,9 @@
 {
   "name": "codex-dsh-desktop",
-  "version": "0.1.9",
+  "version": "0.2.1",
   "private": true,
   "type": "module",
-  "description": "Windows desktop bridge between Codex MCP and DeepSeek Harness ACP",
+  "description": "Windows desktop bridge between Codex MCP and DeepSeek Harness native desktop conversations",
   "author": "Codex DSH Bridge",
   "license": "MIT",
   "main": "dist/main.js",

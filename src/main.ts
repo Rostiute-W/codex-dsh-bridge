@@ -177,7 +177,9 @@ function installIpc(): void {
             if (existing !== content) {
               const info=await lstat(skillTarget);
               const previous=createHash('sha256').update(existing.replace(/\r\n/g,'\n')).digest('hex');
-              if(info.isSymbolicLink()||info.nlink>1||previous!=='7072ae3ec20c25b6609f659df3731d012712d100e73f7025e204aa0f838f0df3')throw new Error('已有同名 Skill 且内容不同。请先备份或更名，不会覆盖用户文件。');
+              // 仅这两个已核对的原版摘要可备份升级；用户改动、链接一律拒绝。
+              const knownOriginal=previous==='7072ae3ec20c25b6609f659df3731d012712d100e73f7025e204aa0f838f0df3'||previous==='2ee799b5dbd64d98cb877f35cab7def1210ef89561b2cc6ec3e0ef93afdc580c';
+              if(info.isSymbolicLink()||info.nlink>1||!knownOriginal)throw new Error('已有同名 Skill 且内容不同。请先备份或更名，不会覆盖用户文件。');
               await copyFile(skillTarget,`${skillTarget}.bridge-backup-${Date.now()}`);
             }
           }

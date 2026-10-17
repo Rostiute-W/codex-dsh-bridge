@@ -1,6 +1,6 @@
 {
   "name": "@codex-dsh/desktop-observer",
-  "version": "0.1.8",
+  "version": "0.2.1",
   "description": "在 DeepSeek Harness 原生对话中执行 Codex 交接任务",
   "type": "module",
   "main": "index.js",
