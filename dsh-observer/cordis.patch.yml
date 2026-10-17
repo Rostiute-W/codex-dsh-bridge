@@ -1,0 +1,3 @@
+- insert:
+    - id: codex-dsh-observer
+      name: '@codex-dsh/desktop-observer'

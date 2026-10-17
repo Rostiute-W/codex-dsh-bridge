@@ -1,0 +1,64 @@
+{
+  "name": "codex-dsh-desktop",
+  "version": "0.1.9",
+  "private": true,
+  "type": "module",
+  "description": "Windows desktop bridge between Codex MCP and DeepSeek Harness ACP",
+  "author": "Codex DSH Bridge",
+  "license": "MIT",
+  "main": "dist/main.js",
+  "scripts": {
+    "build": "tsc && node scripts/build-assets.cjs",
+    "typecheck": "tsc --noEmit",
+    "test": "npm run build && node --test --test-concurrency=1 dist/tests/*.test.js",
+    "start": "npm run build && electron .",
+    "package": "npm run build && electron-builder --win nsis --x64",
+    "smoke": "npm run build && electron . --smoke-test",
+    "doctor:acp": "npm run build && node dist/doctor.js"
+  },
+  "dependencies": {
+    "@agentclientprotocol/sdk": "1.7.0",
+    "@modelcontextprotocol/sdk": "1.32.0",
+    "smol-toml": "^1.9.0",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "electron": "44.5.1",
+    "electron-builder": "26.15.3",
+    "typescript": "^5.9.3"
+  },
+  "build": {
+    "appId": "local.codexdsh.bridge",
+    "productName": "Codex DSH Bridge",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "!dist/tests/**/*",
+      "package.json",
+      "skill/**/*",
+      "dsh-observer/**/*",
+      "README.md",
+      "LICENSE"
+    ],
+    "extraResources": [
+      {
+        "from": "build/pipe-host.exe",
+        "to": "pipe-host.exe"
+      }
+    ],
+    "win": {
+      "target": "nsis",
+      "icon": "assets/icon.ico",
+      "signExecutable": false
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "deleteAppDataOnUninstall": false
+    },
+    "asar": true
+  }
+}

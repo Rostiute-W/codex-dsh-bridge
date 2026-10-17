@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>Codex DSH Bridge</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <aside class="sidebar">
+    <div class="brand">
+      <img class="brand-mark" src="icon.png" alt="">
+      <div class="brand-text"><strong>BRIDGE</strong><span>CODEX / DEEPSEEK</span></div>
+    </div>
+    <div class="nav-label">工作空间</div>
+    <nav aria-label="软件导航">
+      <button class="nav-item selected" data-page="tasks">
+        <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M8 6h13"/><path d="M8 12h13"/><path d="M8 18h13"/><path d="M3.5 6h.01"/><path d="M3.5 12h.01"/><path d="M3.5 18h.01"/></svg>
+        <span class="nav-text">任务协作</span>
+        <span class="count" id="task-count">0</span>
+      </button>
+      <button class="nav-item" data-page="integration">
+        <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22v-4"/><path d="M9 8V2"/><path d="M15 8V2"/><path d="M18 8v4a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4V8Z"/></svg>
+        <span class="nav-text">Codex 接入</span>
+      </button>
+      <button class="nav-item" data-page="settings">
+        <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M21 5h-7"/><path d="M10 5H3"/><path d="M21 12h-9"/><path d="M8 12H3"/><path d="M21 19h-5"/><path d="M12 19H3"/><path d="M14 3v4"/><path d="M8 10v4"/><path d="M16 17v4"/></svg>
+        <span class="nav-text">运行设置</span>
+      </button>
+    </nav>
+    <div class="sidebar-bottom">
+      <div class="service"><i class="dot"></i><span id="service-status">本地服务运行中</span></div>
+      <p>关闭窗口后继续在托盘运行</p>
+      <span id="version">v0.1.0</span>
+    </div>
+  </aside>
+  <main>
+    <header>
+      <div class="header-title"><span class="eyebrow">LOCAL AGENT WORKSPACE</span><h1 id="page-title">任务协作</h1></div>
+      <div class="header-meta"><span id="connection-state" class="meta-text">等待 Codex 接入</span><span class="local-badge"><i class="dot"></i>本地执行</span></div>
+    </header>
+    <section id="tasks-page" class="page">
+      <div class="overview">
+        <div class="stat"><span>总任务</span><strong id="total">0</strong></div>
+        <div class="stat"><span>执行中</span><strong id="running">0</strong></div>
+        <div class="stat"><span>等待审查</span><strong id="review-count">0</strong></div>
+        <div class="stat"><span>已完成</span><strong id="complete-count">0</strong></div>
+      </div>
+      <div id="empty" class="empty-state">
+        <span class="eyebrow">从一份明确的方案开始</span>
+        <h2>Codex 规划，DSH 执行，Codex 审查。</h2>
+        <p>在 Codex 中提交任务，这里会展示编码进度、验证结果和审查报告。<br>你的任务与工作现场将保存在本地。</p>
+        <div class="flow-mark" aria-hidden="true">
+          <div class="flow-step"><span class="flow-tag">C</span><strong>Codex 规划</strong><small>确认方案与验收条件</small></div>
+          <svg class="flow-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12h15"/><path d="M13 6l6 6-6 6"/></svg>
+          <div class="flow-step accent"><span class="flow-tag">D</span><strong>DSH 执行</strong><small>在独立 worktree 实现</small></div>
+          <svg class="flow-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12h15"/><path d="M13 6l6 6-6 6"/></svg>
+          <div class="flow-step"><span class="flow-tag">C</span><strong>Codex 审查</strong><small>核对验证结果与改动</small></div>
+        </div>
+        <div class="empty-actions"><button class="primary" id="empty-connect">连接 Codex <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="M13 6l6 6-6 6"/></svg></button></div>
+        <ul class="empty-points"><li>支持任务恢复</li><li>独立 Git 分支</li><li>审查报告留档</li></ul>
+      </div>
+      <div id="task-workspace" class="task-workspace hidden">
+        <div class="task-panel"><div class="panel-heading">任务列表<span>最新优先</span></div><div id="task-list"></div></div>
+        <div class="detail-panel" id="detail"></div>
+      </div>
+    </section>
+    <section id="integration-page" class="page hidden">
+      <div class="intro">
+        <span class="eyebrow">一次接入，持续协作</span>
+        <h2>Codex 交接，DSH 原生聊天执行</h2>
+        <p>直接在 DSH 的对话中查看过程、补充要求和引导方向；Bridge 负责验证与审查结果回传。</p>
+      </div>
+      <div class="card">
+        <div class="card-top">
+          <div class="card-heading"><h3>自动接入</h3><p id="registration-state">正在检查 Codex 配置</p></div>
+          <button class="primary" id="install-codex">安装到 Codex</button>
+        </div>
+        <p class="muted">相同配置会识别为已注册，重复点击不会重复安装。接入完成后重载 Codex MCP；收到连接握手或工具调用后显示最近调用时间。</p>
+      </div>
+      <div class="card">
+        <div class="card-top">
+          <div class="card-heading"><h3>连接 DSH 原生对话</h3><p>新任务自动新建并打开 DSH 聊天，使用运行设置中的模型选择。</p></div>
+          <button class="secondary" id="install-dsh-observer">安装 DSH 对话连接</button>
+        </div>
+        <p class="muted">先从托盘完整退出 DSH，再点击安装并重新打开。会覆盖本软件旧版只读观察插件的实现。任务消息和权限都在 DSH 处理；聊天继续后必须重新验证，才能审查提交。</p>
+      </div>
+      <div class="card">
+        <h3>开始一个任务</h3>
+        <pre class="prompt">$codex-dsh-bridge 请分析这个项目中的任务，明确方案后交给 DSH 执行，完成后审查代码。</pre>
+        <p class="muted">Codex 会检查 Git 基准和工作区状态，并生成带有验收要求的交接内容。</p>
+      </div>
+      <div class="card">
+        <div class="card-top">
+          <div class="card-heading"><h3>手动 MCP 配置</h3><p>如果自动接入失败，将这段配置合并到 Codex 的 config.toml。</p></div>
+          <button class="secondary" id="copy-config">复制配置</button>
+        </div>
+        <pre id="mcp-config"></pre>
+      </div>
+    </section>
+    <section id="settings-page" class="page hidden">
+      <form id="settings-form">
+        <div class="card">
+          <h3>DSH 原生对话</h3>
+          <p class="muted">默认在 DSH 桌面新建聊天，可以直接引导方向。读取 DSH 中已配置的官方账号、自定义 API 和 Magpie 路由后，在这里选择新任务使用的模型。</p>
+          <label>执行方式<select id="executionMode"><option value="desktop">DSH 原生聊天（推荐）</option><option value="acp">旧版独立 ACP（兼容）</option></select></label>
+          <label>DSH 命令入口<div class="input-row"><input id="dshPath" required><button type="button" class="secondary browse" data-kind="dsh" data-target="dshPath">选择文件</button></div></label>
+          <label>DSH 数据目录（配置、凭据和历史会话，可选）<div class="input-row"><input id="dshHome" placeholder="留空使用 DSH 默认目录，通常为用户目录下的 .dsh"><button type="button" class="secondary browse" data-kind="home" data-target="dshHome">选择目录</button></div></label>
+          <div class="form-actions"><button type="button" class="secondary" id="read-dsh-models">读取 / 刷新 DSH 模型</button></div>
+          <p id="dsh-model-status" class="muted status-line" role="status">点击读取模型；需要时会启动 DSH，不发送任务。</p>
+          <div class="form-grid">
+            <label>新任务的供应商<select id="nativeProvider"><option value="">跟随 DSH 默认</option></select></label>
+            <label>模型 / 路由<select id="nativeModelId" disabled></select></label>
+          </div>
+          <label>推理强度<select id="nativeEffort" disabled><option value="">使用模型默认</option></select></label>
+          <p class="muted">Key 和路由凭据保留在 DSH / Magpie 中。保存后仅用于新任务；你仍可在 DSH 对话中切换模型。首次应用所选模型时，DSH 官方接口也会更新 DSH 默认模型。支持 max 的模型在新选择时优先使用 max。</p>
+          <label>单次运行时限（分钟）<input id="timeoutMinutes" type="number" min="1" max="300" value="300" required></label>
+          <p class="muted">原生聊天使用 DSH 桌面模型和权限设置，遵循全局与项目指令。数据目录保存 DSH 配置与会话；任务代码仍位于独立 Git 工作区。旧 ACP 任务保留历史，不会自动转换成原生聊天。</p>
+        </div>
+        <div class="settings-footer"><span id="data-root" class="muted"></span><button class="primary" type="submit">保存设置</button></div>
+      </form>
+    </section>
+  </main>
+  <div id="toast" role="status" class="toast hidden"></div>
+  <dialog id="resume-dialog"><form method="dialog"><h3>明确恢复任务</h3><p>软件不会重发上次未确认的任务。请写明从当前现场继续的要求。</p><textarea id="resume-instruction" rows="5" minlength="10" placeholder="例如：检查当前修改和未完成步骤，保持原方案边界，继续完成并运行验收命令。"></textarea><div class="dialog-actions"><button value="cancel" class="secondary">取消</button><button id="confirm-resume" value="confirm" class="primary">恢复执行</button></div></form></dialog>
+  <script src="app.js" type="module"></script>
+</body>
+</html>
