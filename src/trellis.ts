@@ -29,6 +29,16 @@ export interface TrellisContext {
   sha256: string;
 }
 
+/** 任务目录里保存的最小上下文元数据；正文只存在固定快照中。 */
+export interface TrellisPin {
+  taskPath: string;
+  baseCommit: string;
+  sha256: string;
+  /** Bridge 数据目录中的固定副本路径，不在 worktree 内。 */
+  snapshotPath: string;
+  files: { path: string; sha256: string; roles: TrellisRole[] }[];
+}
+
 /** 上限取自 Trellis 0.6.17 context_injection 默认值；超出即报错，绝不截断。 */
 export const trellisLimits = { maxFiles: 64, maxFileBytes: 65_536, maxTotalBytes: 131_072 } as const;
 
@@ -95,14 +105,25 @@ async function locate(root: string, segments: string[], label: string): Promise<
   return { abs: current, info };
 }
 
+const BOM = '\uFEFF';
+
+/**
+ * TextDecoder 会吞掉 UTF-8 BOM，而 file.sha256 是原始字节摘要；
+ * 因此把 BOM 显式放回 content，保证 content 的 UTF-8 字节与磁盘一致，可重新校验。
+ */
 function decode(buffer: Buffer, key: string): string {
-  try { return new TextDecoder('utf-8', { fatal: true }).decode(buffer); }
+  let text: string;
+  try { text = new TextDecoder('utf-8', { fatal: true }).decode(buffer); }
   catch { throw new Error(`上下文文件不是有效的 UTF-8 文本：${key}`); }
+  return buffer[0] === 0xef && buffer[1] === 0xbb && buffer[2] === 0xbf ? BOM + text : text;
 }
+
+/** JSON/JSONL 解析前去掉 BOM：Windows 记事本保存的任务文件常带 BOM。 */
+const bomless = (text: string): string => (text.startsWith(BOM) ? text.slice(1) : text);
 
 function assertTaskObject(text: string, key: string): void {
   let data: unknown;
-  try { data = JSON.parse(text); }
+  try { data = JSON.parse(bomless(text)); }
   catch { throw new Error(`${key} 不是合法 JSON`); }
   if (typeof data !== 'object' || data === null || Array.isArray(data)) throw new Error(`${key} 必须是 JSON 对象`);
 }
@@ -116,7 +137,7 @@ function parseManifest(text: string, name: string): ManifestEntry[] {
     if (!line.trim()) return;
     const label = `${name}:${index + 1}`;
     let data: unknown;
-    try { data = JSON.parse(line); }
+    try { data = JSON.parse(bomless(line)); }
     catch { throw new Error(`${label} 不是合法 JSON`); }
     if (typeof data !== 'object' || data === null || Array.isArray(data)) throw new Error(`${label} 必须是 JSON 对象`);
     const record = data as Record<string, unknown>;
@@ -224,3 +245,69 @@ export async function loadTrellisContext(worktree: string, taskPath: string, bas
 
   return collector.snapshot(baseCommit.toLowerCase(), normalizedTaskPath);
 }
+
+/** 与加载时一致的摘要：version/baseCommit/taskPath 与每个文件的 path+sha256+roles。 */
+export function trellisDigest(value: { version: 1; baseCommit: string; taskPath: string; files: { path: string; sha256: string; roles: TrellisRole[] }[] }): string {
+  return hash(JSON.stringify({ version: 1, baseCommit: value.baseCommit, taskPath: value.taskPath, files: value.files.map(file => [file.path, file.sha256, file.roles]) }));
+}
+
+/** 元数据必须与快照一一对应：路径唯一、角色排序确定。 */
+function assertPin(input: unknown): asserts input is TrellisContext {
+  if (typeof input !== 'object' || input === null || Array.isArray(input)) throw new Error('Trellis 快照必须是 JSON 对象');
+  const value = input as Record<string, unknown>;
+  if (value.version !== 1) throw new Error(`Trellis 快照版本不支持：${String(value.version)}`);
+  if (typeof value.baseCommit !== 'string' || !/^[0-9a-f]{40,64}$/i.test(value.baseCommit)) throw new Error('Trellis 快照缺少有效 baseCommit');
+  if (typeof value.taskPath !== 'string') throw new Error('Trellis 快照缺少 taskPath');
+  if (typeof value.sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(value.sha256)) throw new Error('Trellis 快照缺少有效摘要');
+  if (!Array.isArray(value.files)) throw new Error('Trellis 快照缺少文件列表');
+  const seen = new Set<string>();
+  let bytes = 0;
+  for (const raw of value.files as unknown[]) {
+    if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) throw new Error('Trellis 快照文件条目必须是对象');
+    const file = raw as Record<string, unknown>;
+    if (typeof file.path !== 'string') throw new Error('Trellis 快照文件缺少 path');
+    const key = splitPath(file.path, '快照文件路径').join('/');
+    if (key !== file.path) throw new Error(`Trellis 快照文件路径不规范：${String(file.path)}`);
+    if (seen.has(key)) throw new Error(`Trellis 快照重复文件：${key}`);
+    seen.add(key);
+    if (typeof file.content !== 'string') throw new Error(`Trellis 快照缺少正文：${key}`);
+    if (typeof file.sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(file.sha256)) throw new Error(`Trellis 快照文件缺少有效摘要：${key}`);
+    if (!Array.isArray(file.roles) || !file.roles.length || file.roles.some(role => !ROLE_ORDER.includes(role as TrellisRole))) throw new Error(`Trellis 快照文件角色无效：${key}`);
+    if (JSON.stringify(file.roles) !== JSON.stringify(ROLE_ORDER.filter(role => (file.roles as TrellisRole[]).includes(role)))) throw new Error(`Trellis 快照文件角色未按确定顺序排列：${key}`);
+    // content 必须与加载时记录的原始字节摘要一致（BOM 已保留在 content 中）。
+    if (hash(Buffer.from(file.content, 'utf8')) !== file.sha256) throw new Error(`Trellis 快照文件内容与摘要不一致：${key}`);
+    bytes += Buffer.byteLength(file.content, 'utf8');
+    if (bytes > trellisLimits.maxTotalBytes * 2) throw new Error('Trellis 快照超出安全上限');
+  }
+  if (!value.files.length) throw new Error('Trellis 快照没有文件');
+  if (trellisDigest(value as unknown as TrellisContext) !== value.sha256) throw new Error('Trellis 快照整体摘要不一致');
+}
+
+/**
+ * 读出并核验固定快照，再与任务元数据比对。
+ *
+ * 缺失、损坏、或与 taskPath/baseCommit/digest/文件清单不一致时抛错 —— 绝不重新从 worktree 加载，
+ * 因为执行者可能已经改过项目文件。
+ */
+export async function verifyTrellisSnapshot(pin: TrellisPin): Promise<TrellisContext> {
+  let text: string;
+  try { text = await readFile(pin.snapshotPath, 'utf8'); }
+  catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    throw new Error(code === 'ENOENT' ? `Trellis 固定快照丢失：${pin.snapshotPath}` : `无法读取 Trellis 固定快照：${safeMessage(error)}`);
+  }
+  let data: unknown;
+  try { data = JSON.parse(bomless(text)); }
+  catch { throw new Error(`Trellis 固定快照不是合法 JSON：${pin.snapshotPath}`); }
+  assertPin(data);
+  const context = data as TrellisContext;
+  if (context.taskPath !== pin.taskPath) throw new Error(`Trellis 固定快照任务路径与任务不一致：${context.taskPath} ≠ ${pin.taskPath}`);
+  if (context.baseCommit.toLowerCase() !== pin.baseCommit.toLowerCase()) throw new Error(`Trellis 固定快照基准与任务不一致：${context.baseCommit} ≠ ${pin.baseCommit}`);
+  if (context.sha256 !== pin.sha256) throw new Error('Trellis 固定快照摘要与任务记录不一致');
+  const expected = JSON.stringify(pin.files);
+  const actual = JSON.stringify(context.files.map(file => ({ path: file.path, sha256: file.sha256, roles: file.roles })));
+  if (expected !== actual) throw new Error('Trellis 固定快照文件清单与任务记录不一致');
+  return context;
+}
+
+const safeMessage = (error: unknown): string => (error instanceof Error ? error.message : String(error));

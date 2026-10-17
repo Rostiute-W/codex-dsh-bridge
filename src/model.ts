@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import type { TrellisPin } from './trellis.js';
 
 export const handoffSchema = z.object({
   requestId: z.string().min(8).max(160),
@@ -13,6 +14,8 @@ export const handoffSchema = z.object({
   validationCommands: z.array(z.string().min(1).max(4000)).min(1).max(20),
   acceptanceCriteria: z.array(z.string().min(1).max(4000)).min(1).max(40),
   commitMessage: z.string().min(8).max(180),
+  // 可选：显式给出 Trellis 任务目录。省略时保持旧流程，完全不读 Trellis。
+  trellis: z.object({ taskPath: z.string().min(1).max(1000) }).strict().optional(),
 }).strict();
 export type Handoff = z.infer<typeof handoffSchema>;
 export const reviewSchema = z.object({
@@ -63,6 +66,8 @@ export interface Task {
   nativeGuidance?: {seq:number;text:string}[];
   round: number; summary: string; error?: string; permission?: Permission;
   checks: Check[]; changedFiles: string[]; fingerprint?: string; diffPath?: string;
+  /** 固定的 Trellis 上下文元数据；正文只在 snapshotPath 指向的 Bridge 数据目录文件里。 */
+  trellis?: TrellisPin;
   review?: Review; reviewSource?: 'codex' | 'api'; apiUsage?: unknown;
   reviewedFingerprint?: string; commit?: string; commitStatus?: string;
   log: { at: string; kind: string; text: string }[];

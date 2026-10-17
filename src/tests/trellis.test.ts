@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { mkdir, mkdtemp, writeFile, symlink } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -196,6 +197,30 @@ test('taskPath 与清单路径都不能越出 worktree', async () => {
   }
 
   await assert.rejects(loadTrellisContext(root, taskPath, 'not-a-commit'), /baseCommit/);
+});
+
+test('Windows 记事本保存的 BOM 文件：保留原始字节摘要，JSON/JSONL 仍可解析', async () => {
+  const root = await worktree();
+  const bom = '\uFEFF';
+  // TextDecoder 默认吞掉 BOM；若按 content 重算摘要，就会与磁盘原始字节不一致。
+  await put(root, `${taskPath}/task.json`, bom + JSON.stringify({ name: 'demo', status: 'in_progress' }));
+  await put(root, `${taskPath}/prd.md`, bom + '# PRD\n需求正文\n');
+  await put(root, '.trellis/spec/bom.md', bom + '# 规范\n');
+  await put(root, `${taskPath}/implement.jsonl`, bom + JSON.stringify({ file: '.trellis/spec/bom.md', reason: 'BOM 清单' }) + '\n');
+
+  const context = await loadTrellisContext(root, taskPath, baseCommit);
+  const byPath = new Map(context.files.map(file => [file.path, file]));
+  for (const [file, text] of [[`${taskPath}/task.json`, JSON.stringify({ name: 'demo', status: 'in_progress' })],
+    [`${taskPath}/prd.md`, '# PRD\n需求正文\n'], ['.trellis/spec/bom.md', '# 规范\n']] as [string, string][]) {
+    const entry = byPath.get(file)!;
+    assert.ok(entry.content.startsWith(bom), `${file} 的正文必须保留 BOM`);
+    assert.equal(entry.content, bom + text, `${file} 只保留一个 BOM`);
+    assert.equal(entry.sha256, createHash('sha256').update(Buffer.from(bom + text, 'utf8')).digest('hex'), `${file} 摘要必须是原始字节摘要`);
+  }
+  // 清单被引用且带 BOM：自身也进入上下文，行解析不受 BOM 影响。
+  const manifest = byPath.get(`${taskPath}/implement.jsonl`)!;
+  assert.ok(manifest.content.startsWith(bom));
+  assert.deepEqual(byPath.get('.trellis/spec/bom.md')!.roles, ['implementation']);
 });
 
 test('符号链接指向 worktree 之外时拒绝读取', async () => {

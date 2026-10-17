@@ -47,6 +47,8 @@ export async function snapshot(task: Task, allowStaged = false): Promise<{ files
   }
   // Fingerprint the filesystem state; staging a new file must not change its identity.
   hash.update(task.handoff.baseCommit);
+  // 审批同时绑定代码与固定的 Trellis 上下文：快照被替换或损坏时指纹一起变化。
+  if (task.trellis) hash.update(JSON.stringify([task.trellis.sha256, task.trellis.taskPath, task.trellis.baseCommit]));
   for (const file of files) {
     validateRelative(file);
     const target = path.join(task.worktree, file);
