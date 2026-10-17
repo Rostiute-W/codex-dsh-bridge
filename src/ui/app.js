@@ -70,6 +70,22 @@ function elapsed(task) { const active = ['queued','preparing','running','awaitin
 function taskTitle(task) { return task.handoff.title.includes('\uFFFD') ? `旧版标题编码损坏 · ${task.id.slice(0,8)}` : task.handoff.title; }
 function button(label, method, task, disabled = false, cls = 'secondary') { const el = node('button', label, cls); el.disabled = disabled; el.addEventListener('click', async () => { el.disabled = true; try { const result = await invoke(method, {taskId:task.id}); if (typeof result === 'string') toast(result); await refresh(); } catch {} finally { el.disabled = disabled; } }); return el; }
 function section(parent, title) { parent.append(node('div', title, 'section-title')); }
+function trellisDetail(task) {
+  const declared = task.handoff?.trellis?.taskPath, pin = task.trellis, files = pin?.files ?? [];
+  const box = node('details'); box.dataset.section = 'trellis';
+  box.append(node('summary', pin ? `Trellis 上下文 · 已固定 ${files.length} 个文件` : declared ? 'Trellis 上下文 · 待固定' : 'Trellis 上下文 · 未关联'));
+  if (!pin) {
+    box.append(node('p', declared
+      ? `交接引用了任务目录 ${declared}，但还没有固定上下文快照，尚未向 DSH 注入 Trellis 内容。固定失败时以上方错误为准。`
+      : '本次交接没有引用 Trellis 任务，未读取任何 Trellis 文件。', 'muted'));
+    return box;
+  }
+  box.append(node('p', '执行开始时从基准 worktree 读取的只读资料，正文只保存在快照文件中；返工、重新验证与恢复沿用同一份快照。', 'muted'));
+  box.append(node('div', `任务目录 ${pin.taskPath}`, 'path'), node('div', `基准提交 ${pin.baseCommit}`, 'path'),
+    node('div', `整体摘要 sha256 ${pin.sha256}`, 'path'), node('div', `快照文件 ${pin.snapshotPath}`, 'path'));
+  box.append(node('pre', files.map(file => `${file.path} · ${file.roles.join(' + ')}\n${file.sha256}`).join('\n\n')));
+  return box;
+}
 function renderDetail(task) {
   const panel = $('detail'); const oldLog = panel.querySelector('.logs'); const scroll = oldLog?.scrollTop ?? 0; const follow = !oldLog || oldLog.scrollHeight - oldLog.scrollTop - oldLog.clientHeight < 40;
   if (panel.dataset.taskId) detailViews.set(panel.dataset.taskId, Object.fromEntries([...panel.querySelectorAll('details')].map(el => [el.dataset.section, {open:el.open,scroll:el.querySelector('pre')?.scrollTop ?? 0}])));
@@ -101,6 +117,7 @@ function renderDetail(task) {
   if(task.executor==='desktop')panel.append(node('p',`执行与方向引导在 DSH 原生聊天中完成。权限请在 DSH 处理。${task.sessionId ? ' 会话：'+task.sessionId : ''}`,'muted'));
   if(task.executor==='desktop')panel.append(node('p',`任务初始模型：${modelKey(task.nativeModel)}。后续手动切换以 DSH 对话为准。`,'muted'));
   const spec = node('details'); spec.dataset.section='handoff'; spec.append(node('summary','查看交接方案'), node('pre', JSON.stringify(task.handoff, null, 2))); panel.append(spec);
+  panel.append(trellisDetail(task));
   if (task.changedFiles.length) { section(panel,'代码变更'); panel.append(node('pre',task.changedFiles.join('\n'))); }
   if (task.checks.length) {
     section(panel,'验证记录'); for (const check of task.checks) { const box = node('div', undefined, 'check'); box.append(node('span',check.exitCode === 0 ? '通过' : `失败 · ${check.exitCode}`,`badge ${check.exitCode === 0 ? 'green' : 'red'}`),node('strong',check.command)); if (check.output) box.append(node('pre',check.output)); panel.append(box); }

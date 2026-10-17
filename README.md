@@ -50,6 +50,30 @@ Bridge 创建 `agent/dsh-…` 分支和独立 worktree，DSH 聊天的工作目�
 
 验证命令是 Codex 明确交接的可信本地命令，在 worktree 中以独立环境执行。目录范围检查不能替代对验收脚本的信任。
 
+## 可选的 Trellis 任务上下文
+
+交接可以带上项目里已有的 Trellis 任务目录，让 DSH 同时看到该任务的 PRD 与被引用的规范。适配 Trellis 0.6.17 的布局 `.trellis/tasks/<name>`；Bridge 只读其中的 Markdown 与 JSON，不需要安装或调用 Trellis 的全局 npm 包，也不把它作为运行时依赖。不带这个字段时行为与以前一致，完全不读 Trellis 文件。
+
+只需在交接里增加一个字段：
+
+```json
+"trellis": { "taskPath": ".trellis/tasks/example" }
+```
+
+这是 `handoff` 中的片段，不是完整的 `submit_task` 示例。`taskPath` 使用仓库相对路径和正斜杠；绝对路径、上级路径、`.git`、盘符与 Windows 数据流一律拒绝。
+
+仓库需要有干净的 Git 基准，且基准中已经提交任务目录的 `task.json` 与 `prd.md`，以及清单引用到的规范文件。规范从基准 worktree 读取：任务目录可选 `design.md`、`implement.md`；`implement.jsonl` 与 `check.jsonl` 每行一个 `{"file": "…", "reason": "…"}` 对象，`type` 省略时按单文件处理，写 `"directory"` 则只展开该目录本层、按名称排序的 Markdown，不递归。每个文件带 role 说明它被读的原因：`implementation` 来自 `implement.jsonl`，`review` 来自 `check.jsonl`，`shared` 是 `task.json`、`prd.md` 这类任务本身；同一文件被多处引用时合并 role，只读一次。
+
+上限和失败方式都是明确的：最多 64 个文件、单文件 64 KiB、总计 128 KiB，超出直接报错停止，绝不截断。经过符号链接或目录联接、越出 worktree、命中 `.env`、密钥或证书一类文件、以及 `.runtime` 的引用同样被拒绝；资料中出现明显凭据时任务在发送前停止。
+
+Bridge 在首次发送前读取一次，写成 Bridge 数据目录中的固定快照；任务详情只展示路径、基准、摘要、快照位置、各文件来源与 role，不展示正文。自动返工、重新验证、恢复与后续发送都复用这份快照，不会重新读取可能已被改动的项目文件；快照缺失、损坏或与任务记录不一致时停止并报错，不悄悄重建。需求或规范变了就要新建任务：新的 requestId 和新的基准提交。
+
+Codex 审查必须以结果中的 `trellis.snapshotPath` 固定内容与文件摘要为依据，`handoff` 只说明引用了哪个任务目录。不要只读当前 worktree 里可能已被改动的规范；固定内容与 `handoff` 或验收条件冲突时报告冲突，并按 `handoff` 为准。
+
+Trellis 在这里只提供参考。Bridge 仍然负责执行、验收、审批与 Git 提交，不调用 Trellis 的 `start`／`finish`／`archive`，不初始化项目或任务，不同步它的 journal，也不增设第二套验收。
+
+这是源码功能，当前 0.1.9 安装包未因此升级。
+
 ## 中文与历史数据
 
 0.1.3 修复了 Windows 管道辅助程序使用本机代码页输出 JSON 导致的中文损坏，管道全程使用 UTF-8，并正确处理跨数据包的多字节字符。PowerShell 验证输出显式使用 UTF-8，关闭进度 CLIXML。
