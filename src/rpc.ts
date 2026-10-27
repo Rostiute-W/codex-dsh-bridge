@@ -52,7 +52,7 @@ export async function servePipe(host: string, engine: Engine, onCall: () => void
         }
         else {
           const params = z.object({ taskId: z.string().uuid(), timeoutMs: z.number().int().min(0).max(600000).optional() }).strict().parse(request.params);
-          if (request.method === 'wait') result = await engine.wait(params.taskId, params.timeoutMs ?? 600000);
+          if (request.method === 'wait') result = await engine.wait(params.taskId, params.timeoutMs ?? 600000, true);
           else if (request.method === 'cancel') result = engine.result((await engine.cancel(params.taskId)).id);
           else result = engine.result(params.taskId);
         }

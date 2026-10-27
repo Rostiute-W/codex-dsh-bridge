@@ -32,7 +32,11 @@ The worker creates a dedicated worktree. DSH must not stage, commit, switch bran
 
 ## Wait and review
 
-Use `wait_task` with the returned task ID and `timeoutMs: 600000`. A waiting timeout is a checkpoint, not a failure; wait again using the same ID. Avoid short polling. For native tasks, direct the user to their DSH conversation for permissions or guidance. Legacy ACP tasks still request permission in Bridge. Do not fabricate a permission decision.
+After execute, revise or resume, keep the current Codex turn open and use `wait_task` with the returned task ID and `timeoutMs: 600000`. Follow the response's `nextAction`. When `nextAction.type` is `wait`, immediately make the indicated call with the same task ID. A `wait.reason` of `timeout` or `progress` is a checkpoint, never completion; do not give a final response or submit another execute request. Progress returns when the phase changes (including DSH completion followed by validation) or a validation command finishes. Report meaningful progress briefly, then wait again. Avoid short polling.
+
+Do not stop at “DSH is running” for an implementation task. Continue through validation and the exact-fingerprint review. Only the user's explicit request for background-only delivery permits ending while active; explain then that Bridge cannot wake an ended Codex turn or automatically push a reply into it. Never promise an automatic callback. On older Bridge versions without these fields, treat queued/preparing/running/validating/review_running/committing as requiring another wait.
+
+If the MCP transport closes, preserve the task ID and recover the configured connection before querying that existing task. Do not resend execution or claim a watcher remains active. If reconnection is unavailable, state the interruption and the task ID explicitly; a preserved DSH conversation is not a delivered review result. For native tasks, direct the user to their DSH conversation for permissions or guidance. Legacy ACP tasks still request permission in Bridge. Do not fabricate a permission decision.
 
 If the user continues the DSH conversation after validation, the review is stale even when file contents did not change. Wait for DSH to finish, use `submit_task` with `operation: revalidate` and `taskId`, and review the resulting fingerprint and checks again. During the short commit step the Host rejects new agent steps; continue chatting after it finishes. Approval never includes unreviewed later turns.
 

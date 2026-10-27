@@ -314,7 +314,11 @@ export class Engine extends EventEmitter {
   }
   result(id: string): Record<string, unknown> {
     const task = this.task(id);
-    return { taskId: task.id, status: task.status, title: task.handoff.title, worktree: task.worktree, branch: task.branch,
+    const nextAction = (task.status === 'queued' || busyStatuses.has(task.status) && task.status !== 'awaiting_permission')
+      ? { type: 'wait', tool: 'wait_task', arguments: { taskId: task.id, timeoutMs: 600000 } }
+      : { type: task.status === 'awaiting_review' ? 'review' : task.status === 'completed' ? 'done' : 'attention' };
+    return { taskId: task.id, status: task.status, updatedAt: task.updatedAt, nextAction,
+      title: task.handoff.title, worktree: task.worktree, branch: task.branch,
       executor: task.executor ?? 'acp', nativeCursor:task.nativeCursor,
       nativeGuidance:task.nativeGuidance,
       nativeModel:task.nativeModel,
@@ -326,16 +330,25 @@ export class Engine extends EventEmitter {
       commit: task.commit, commitMessage: task.handoff.commitMessage, gitStatus: task.commitStatus,
       localOnly: true, error: task.error, permission: task.permission ? { title: task.permission.title, action: '在桌面软件中处理' } : undefined };
   }
-  async wait(id: string, timeoutMs: number): Promise<Record<string, unknown>> {
+  async wait(id: string, timeoutMs: number, reportProgress = false): Promise<Record<string, unknown>> {
+    const started = Date.now();
     const waiting = () => ['queued', 'preparing', 'running', 'validating', 'review_running', 'committing'].includes(this.task(id).status);
-    if (!waiting()) return this.result(id);
-    await new Promise<void>(resolve => {
-      const finish = () => { clearTimeout(timer); this.removeListener('change', listener); resolve(); };
-      const listener = () => { if (!waiting()) finish(); };
-      const timer = setTimeout(finish, Math.min(Math.max(timeoutMs, 0), 600_000));
-      this.on('change', listener); if (!waiting()) finish();
-    });
-    return this.result(id);
+    const progress = () => { const task = this.task(id); return task.status + ':' + task.checks.length; };
+    const initialProgress = progress();
+    let reason: 'ready' | 'progress' | 'timeout' = 'ready';
+    if (waiting()) {
+      reason = 'timeout';
+      await new Promise<void>(resolve => {
+        const finish = () => { clearTimeout(timer); this.removeListener('change', listener); resolve(); };
+        const listener = () => {
+          if (!waiting()) { reason = 'ready'; finish(); }
+          else if (reportProgress && progress() !== initialProgress) { reason = 'progress'; finish(); }
+        };
+        const timer = setTimeout(finish, Math.min(Math.max(timeoutMs, 0), 600_000));
+        this.on('change', listener); listener();
+      });
+    }
+    return { ...this.result(id), wait: { reason, elapsedMs: Date.now() - started } };
   }
   async shutdown(): Promise<void> {
     this.stopping = true;

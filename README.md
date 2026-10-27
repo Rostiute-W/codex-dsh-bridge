@@ -103,9 +103,13 @@ Bridge 只暴露四个工具，全部围绕同一个任务 ID：
 | 工具 | 作用 |
 | --- | --- |
 | `submit_task` | `execute` 提交新交接；`review` 回传审查；`revise` 按审查意见返工；`resume` 明确恢复；`revalidate` 在用户引导后重新验收 |
-| `wait_task` | 等待任务落定或权限请求，最多十分钟，不调用模型；超时用同一 `taskId` 继续等 |
+| `wait_task` | 最多等待十分钟，在阶段变化、验收命令完成或需要审查／处理时返回；超时或进度返回后按 `nextAction` 用同一 `taskId` 续等 |
 | `get_task_result` | 读取状态、精确 worktree 与指纹、验收证据、审查结论和本地提交；可在后续 Codex 聊天中取回结果 |
 | `cancel_task` | 取消执行并保留全部文件，不丢弃修改、不删除任务工作区 |
+
+`wait_task` 返回 `wait.reason`（`progress`、`timeout` 或 `ready`）与 `elapsedMs`。结果中的 `nextAction.type = wait` 带有下一次 `wait_task` 的工具名和参数，表示任务仍在进行。DSH 写完回复后，Bridge 还会执行验收；这段时间会先返回执行摘要和验证进度，Codex 应简短告知进展后继续等待。只有到 `awaiting_review` 才开始代码审查，权限或异常状态则交由用户处理。
+
+Codex 必须在同一轮持续等待、验收和审查，不能在“正在执行”时结束后再承诺自动交接。Bridge 无法主动唤醒已结束的 Codex 轮次；用户明确选择后台交接时，后续可凭任务 ID 取回结果。MCP 连接断开时也应先恢复连接并查询原任务，不能重新提交同一工作。
 
 `requestId` 幂等：同一 `requestId` 重试必须携带完全相同的交接。审查必须携带当前指纹，指纹不符会被拒绝。审查只由 Codex 回传，Bridge 不自行调用模型。
 
