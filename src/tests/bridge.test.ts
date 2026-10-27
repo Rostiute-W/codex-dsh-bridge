@@ -6,15 +6,14 @@ import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { Store } from '../store.js';
 import { Engine } from '../engine.js';
-import { git, snapshot } from '../git.js';
+import { git } from '../git.js';
 import { runAcp, type AgentRun } from '../acp.js';
-import { runProcess, cleanEnvironment, startProcess, terminateTree, resolveCodexExecutable } from '../process.js';
+import { runProcess, cleanEnvironment, resolveCodexExecutable } from '../process.js';
 import { servePipe, identity, pipeName, pipePath, pipeRequest } from '../rpc.js';
 import { type Handoff, type Task } from '../model.js';
 import net from 'node:net';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
-import { apiReview } from '../reviewer.js';
 
 const project = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const helper = path.join(project, 'build', 'pipe-host.exe');
@@ -119,15 +118,6 @@ test('max-token stop is never treated as task success', async () => {
   assert.match(task.error!,/max_tokens/); assert.equal(task.commit,undefined); await f.engine.shutdown();
 });
 
-test('duplicate paid requests reserve task before awaiting credentials; no API call without a key', async () => {
-  const f = await fixture(); const task = await f.engine.submit({operation:'execute',handoff:f.handoff}); await waitFor(f.engine,task,'awaiting_review');
-  let rejectKey: (error: Error) => void = () => {}; let keyRequests = 0;
-  const first = f.engine.paidReview(task.id,() => { keyRequests++; return new Promise((_resolve,reject) => {rejectKey=reject;}); });
-  await assert.rejects(f.engine.paidReview(task.id,async () => 'not-a-real-key'),/等待|审查状态/);
-  while (!keyRequests) await new Promise(resolve => setTimeout(resolve,20));
-  rejectKey(new Error('No key for mock test')); await first; assert.equal(keyRequests,1); assert.equal(task.status,'awaiting_review'); assert.equal(task.commit,undefined); await f.engine.shutdown();
-});
-
 test('request IDs cannot be reused for different handoffs; incomplete plans are rejected', async () => {
   const f = await fixture('slow'); const task = await f.engine.submit({operation:'execute',handoff:f.handoff});
   await assert.rejects(f.engine.submit({operation:'execute',handoff:{...f.handoff,title:'Different'}}),/不同/);
@@ -199,29 +189,6 @@ test('a Git hook changing reviewed content preserves commit hash and requires at
   await git(task.worktree!,['config','core.hooksPath',hooks.replace(/\\/g,'/')]);
   await f.engine.submit({operation:'review',taskId:task.id,fingerprint:task.fingerprint,review:{verdict:'approved',summary:'Review before hook mutation.',issues:[]}});
   assert.equal(task.status,'needs_attention'); assert.match(task.error!,/hook/); assert.ok(task.commit);
-});
-
-test('manual API review uses isolated auth, scrubs credentials, and never retries failures', {skip:process.platform !== 'win32'}, async () => {
-  const f = await fixture(); const task = await f.engine.submit({operation:'execute',handoff:f.handoff}); await waitFor(f.engine,task,'awaiting_review');
-  f.store.settings.codexPath = path.join(project,'build','mock-reviewer.exe'); f.store.settings.apiModel = 'mock-changes';
-  const key = 'synthetic-credential-for-test-only';
-  task.nativeGuidance=[{seq:7,text:'native-guidance-test: preserve the direction given in DSH.'}];
-  await f.engine.paidReview(task.id,async () => key);
-  assert.equal(task.status,'needs_changes',task.error); assert.equal(task.reviewSource,'api'); assert.equal(task.commit,undefined);
-  assert.ok(!JSON.stringify(task).includes(key));
-  const dir=f.store.taskDir(task.id), home=path.join(dir,'api-home');
-  const invocation=JSON.parse(await readFile(path.join(home,'mock-invocation.json'),'utf8'));
-  assert.equal(invocation.home,home); assert.ok(invocation.args.includes('--ignore-user-config')); assert.ok(invocation.args.includes('read-only')); assert.ok(invocation.args.includes('mcp_servers={}'));
-  assert.ok(invocation.args.includes('features.multi_agent=false'));
-  assert.equal(invocation.guidancePresent,true);
-  assert.ok(!(await readFile(path.join(dir,'api-report.json'),'utf8')).includes(key));
-  f.store.settings.apiModel='mock-failure';
-  await assert.rejects(apiReview(task,f.store.settings,dir,key,new AbortController().signal,()=>{}),/失败/);
-  await assert.rejects(readFile(path.join(dir,'api-report.json')),/ENOENT/);
-  // A successful exit without a new report must not reuse an older approval.
-  await writeFile(path.join(dir,'api-report.json'),JSON.stringify({verdict:'approved',summary:'stale',issues:[]}));
-  f.store.settings.apiModel='mock-no-report';
-  await assert.rejects(apiReview(task,f.store.settings,dir,key,new AbortController().signal,()=>{}),/ENOENT/);
 });
 
 test('official MCP client lists four tools and submits/reads task through Windows pipe', {skip:process.platform !== 'win32'}, async () => {

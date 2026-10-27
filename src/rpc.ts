@@ -14,10 +14,20 @@ import { observerSnapshot } from './observer.js';
 const envelopeSchema = z.object({ id: z.string().uuid(), method: z.enum(['submit', 'wait', 'result', 'cancel', 'ping', 'observe']), params: z.unknown() }).strict();
 // Read the shipped manifest instead of a hardcoded version so ping matches package.json.
 const version: string = (JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8')) as { version: string }).version;
-export async function identity(host: string): Promise<string> {
-  const output = await runProcess(host, ['--identity'], { env: cleanEnvironment(), timeoutMs: 10_000 });
-  if (output.code !== 0 || !/^S-1-[0-9-]+$/.test(output.stdout.trim())) throw new Error('无法获取 Windows 用户标识。');
-  return output.stdout.trim();
+// The SID cannot change while a process runs; spawning the host for it on every pipe request costs 0.5-3s.
+const identities = new Map<string, Promise<string>>();
+export function identity(host: string): Promise<string> {
+  let cached = identities.get(host);
+  if (!cached) {
+    cached = runProcess(host, ['--identity'], { env: cleanEnvironment(), timeoutMs: 10_000 }).then(output => {
+      if (output.code !== 0 || !/^S-1-[0-9-]+$/.test(output.stdout.trim())) throw new Error('无法获取 Windows 用户标识。');
+      return output.stdout.trim();
+    });
+    // Failures are not cached, so a missing or rebuilt host is retried on the next request.
+    cached.catch(() => identities.delete(host));
+    identities.set(host, cached);
+  }
+  return cached;
 }
 export function pipeName(sid: string): string {
   return 'codex-dsh-' + createHash('sha256').update(sid + (process.env.BRIDGE_INSTANCE ?? '')).digest('hex').slice(0, 24);

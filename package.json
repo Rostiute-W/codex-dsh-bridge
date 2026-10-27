@@ -8,6 +8,7 @@
   "license": "MIT",
   "main": "dist/main.js",
   "scripts": {
+    "prebuild": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
     "build": "tsc && node scripts/build-assets.cjs",
     "typecheck": "tsc --noEmit",
     "test": "npm run build && node --test --test-concurrency=1 dist/tests/*.test.js",

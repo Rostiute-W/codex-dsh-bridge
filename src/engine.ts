@@ -8,10 +8,12 @@ import { runDsh, type AgentRun } from './acp.js';
 import { runDesktopDsh, nativeIdle, nativeRequest } from './desktop.js';
 import { git, prepareWorktree, snapshot, assertScope, finishCommit } from './git.js';
 import { runProcess, cleanEnvironment } from './process.js';
-import { apiReview } from './reviewer.js';
 import { loadTrellisContext, verifyTrellisSnapshot, type TrellisContext } from './trellis.js';
-import { handoffSchema, submitSchema, busyStatuses, redact, safeError, validateReview, type Task, type Handoff, type Submit, type Review } from './model.js';
+import { submitSchema, busyStatuses, redact, safeError, validateReview, type Status, type Task, type Handoff, type Review } from './model.js';
 
+// wait() returns once a task leaves these; awaiting_permission also returns so Codex can tell the user.
+const waitingStatuses = new Set<Status>(['queued', 'preparing', 'running', 'validating', 'review_running', 'committing']);
+const revalidatableStatuses = new Set<Status>(['needs_attention', 'awaiting_review', 'needs_changes', 'cancelled']);
 const runAgent: AgentRun = (...args) => (args[0].executor === 'desktop' ? runDesktopDsh : runDsh)(...args);
 export class Engine extends EventEmitter {
   private active?: { id: string; controller: AbortController };
@@ -100,7 +102,11 @@ export class Engine extends EventEmitter {
         if (controller.signal.aborted) throw new Error('执行已取消或超时。');
         const passed = await this.validate(task, controller.signal);
         if (passed) { task.status = 'awaiting_review'; await this.changed(task); break; }
-        if(task.executor==='desktop'&&task.nativeGuidance?.length){task.status='needs_changes';task.error='DSH 中已有用户引导，当前验收未通过。已停止自动返工，请 Codex 结合 nativeGuidance 判断方案与验收是否需要调整。';await this.changed(task);break;}
+        if (task.executor === 'desktop' && task.nativeGuidance?.length) {
+          task.status = 'needs_changes';
+          task.error = 'DSH 中已有用户引导，当前验收未通过。已停止自动返工，请 Codex 结合 nativeGuidance 判断方案与验收是否需要调整。';
+          await this.changed(task); break;
+        }
         if (attempt >= 2 || task.round >= 2) { task.status = 'needs_changes'; task.error = '自动验证仍未通过。请查看检查记录并人工决定下一步。'; await this.changed(task); break; }
         task.round++; this.instructions.set(task.id, '修复以下真实验证失败，保持原方案范围，不提交、不暂存、不更改 Git 历史：\n' + JSON.stringify(task.checks.filter(c => c.exitCode !== 0)));
       }
@@ -254,10 +260,14 @@ export class Engine extends EventEmitter {
   }
   async revalidate(id: string): Promise<Task> {
     const task = this.task(id);
-    if (this.isActive() || !task.worktree || !['needs_attention', 'awaiting_review', 'needs_changes', 'cancelled'].includes(task.status)) throw new Error('当前无法重新验证，请等待执行结束。');
+    if (this.isActive() || !task.worktree || !revalidatableStatuses.has(task.status)) throw new Error('当前无法重新验证，请等待执行结束。');
     const controller = new AbortController(); this.active = { id, controller };
     const timer = setTimeout(() => controller.abort('timeout'), this.store.settings.timeoutMinutes * 60_000);
-    try { if(task.executor==='desktop')task.nativeCursor=(await nativeIdle(task,false)).cursor; task.status = await this.validate(task, controller.signal) ? 'awaiting_review' : 'needs_changes'; delete task.review; delete task.reviewedFingerprint; }
+    try {
+      if (task.executor === 'desktop') task.nativeCursor = (await nativeIdle(task, false)).cursor;
+      task.status = await this.validate(task, controller.signal) ? 'awaiting_review' : 'needs_changes';
+      delete task.review; delete task.reviewedFingerprint;
+    }
     catch (error) { task.status = 'needs_attention'; task.error = safeError(error); }
     finally { clearTimeout(timer); this.active = undefined; await this.changed(task); void this.pump(); }
     return task;
@@ -281,36 +291,14 @@ export class Engine extends EventEmitter {
     task.reviewedFingerprint = fingerprint; task.status = 'committing'; await this.changed(task);
     let token: string | undefined;
     try {
-      if(task.executor==='desktop')token=(await nativeRequest('lock',{taskId:task.id,cursor:task.nativeCursor}) as {token:string}).token;
+      if (task.executor === 'desktop') token = (await nativeRequest('lock', { taskId: task.id, cursor: task.nativeCursor }) as { token: string }).token;
       await finishCommit(task); task.status = 'completed'; delete task.error;
     }
     catch (error) { task.status = 'needs_attention'; task.error = safeError(error); }
-    finally {if(token)await nativeRequest('unlock',{taskId:task.id,token}).catch(()=>this.log(task,'error','DSH 提交保护未确认释放，将在五分钟内自动过期。'));}
+    finally {
+      if (token) await nativeRequest('unlock', { taskId: task.id, token }).catch(() => this.log(task, 'error', 'DSH 提交保护未确认释放，将在五分钟内自动过期。'));
+    }
     await this.changed(task); return task;
-  }
-  async paidReview(id: string, getKey: () => Promise<string>): Promise<Task> {
-    const task = this.task(id);
-    if (task.status !== 'awaiting_review' || this.isActive()) throw new Error('请等待其他执行结束，且任务必须在等待审查状态。');
-    // Reserve before awaiting key retrieval so double-clicks cannot create duplicate paid runs.
-    task.status = 'review_running'; const controller = new AbortController(); this.active = { id, controller };
-    const timer = setTimeout(() => controller.abort('timeout'), this.store.settings.timeoutMinutes * 60_000);
-    try {
-      await this.changed(task);
-      if(task.executor==='desktop')await nativeIdle(task);
-      const current = await snapshot(task); if (current.fingerprint !== task.fingerprint) throw new Error('代码已变更，请重新验证。');
-      const key = await new Promise<string>((resolve, reject) => {
-        const abort = () => reject(new Error('API 审查已取消或超时。'));
-        controller.signal.addEventListener('abort', abort, { once: true });
-        if (controller.signal.aborted) abort();
-        getKey().then(resolve, reject).finally(() => controller.signal.removeEventListener('abort', abort));
-      });
-      const result = await apiReview(task, this.store.settings, this.store.taskDir(id), key, controller.signal, text => this.log(task, 'api', text));
-      task.apiUsage = result.usage; task.status = 'awaiting_review';
-      await this.acceptReview(task, current.fingerprint, result.review, 'api');
-    } catch (error) {
-      task.status = controller.signal.aborted ? 'cancelled' : 'awaiting_review'; task.error = safeError(error); await this.changed(task);
-    } finally { clearTimeout(timer); this.active = undefined; this.emit('change'); void this.pump(); }
-    return task;
   }
   result(id: string): Record<string, unknown> {
     const task = this.task(id);
@@ -332,7 +320,7 @@ export class Engine extends EventEmitter {
   }
   async wait(id: string, timeoutMs: number, reportProgress = false): Promise<Record<string, unknown>> {
     const started = Date.now();
-    const waiting = () => ['queued', 'preparing', 'running', 'validating', 'review_running', 'committing'].includes(this.task(id).status);
+    const waiting = () => waitingStatuses.has(this.task(id).status);
     const progress = () => { const task = this.task(id); return task.status + ':' + task.checks.length; };
     const initialProgress = progress();
     let reason: 'ready' | 'progress' | 'timeout' = 'ready';

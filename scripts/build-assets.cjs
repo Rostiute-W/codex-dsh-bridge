@@ -36,7 +36,7 @@ const ico = Buffer.alloc(22); ico.writeUInt16LE(1, 2); ico.writeUInt16LE(1, 4); 
 fs.writeFileSync('assets/icon.ico', Buffer.concat([ico, png]));
 if (process.platform === 'win32') {
   const compiler = path.join(process.env.WINDIR || 'C:\\Windows', 'Microsoft.NET', 'Framework64', 'v4.0.30319', 'csc.exe');
-  for (const [source, output] of [['PipeHost.cs','pipe-host.exe'],['MockReviewer.cs','mock-reviewer.exe']]) {
+  for (const [source, output] of [['PipeHost.cs','pipe-host.exe']]) {
     if (fs.existsSync(`build/${output}`) && fs.statSync(`build/${output}`).mtimeMs >= fs.statSync(`build/${source}`).mtimeMs) continue;
     execFileSync(compiler, ['/nologo', '/target:exe', '/reference:System.Web.Extensions.dll', `/out:${path.resolve('build',output)}`, path.resolve('build',source)], { stdio: 'inherit', windowsHide: true });
   }

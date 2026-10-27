@@ -1,15 +1,15 @@
-import { app, BrowserWindow, Tray, Menu, dialog, ipcMain, shell, nativeImage, clipboard } from 'electron';
+import { app, BrowserWindow, Tray, Menu, dialog, ipcMain, shell, nativeImage, clipboard, nativeTheme } from 'electron';
 import { mkdir, readFile, writeFile, copyFile, lstat, realpath } from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
-import net from 'node:net';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { z } from 'zod';
-import { randomUUID, createHash } from 'node:crypto';
+import { createHash } from 'node:crypto';
 import { Store } from './store.js';
 import { Engine } from './engine.js';
 import { settingsSchema, safeError } from './model.js';
-import { servePipe, pipeRequest, identity, pipeName, pipePath } from './rpc.js';
+import { servePipe } from './rpc.js';
+import { runSmoke } from './smoke.js';
 import { runProcess, resolveCodexExecutable, cleanEnvironment } from './process.js';
 import { readRegistration, registrationState } from './integration.js';
 import { exportObserver } from './observer.js';
@@ -43,7 +43,7 @@ async function nativeCodexPath(configured = 'codex'): Promise<string> {
 function showWindow(): void { if (!win) return; win.show(); if (win.isMinimized()) win.restore(); win.focus(); }
 function createWindow(): void {
   win = new BrowserWindow({ width: 1240, height: 830, minWidth: 960, minHeight: 680, show: false,
-    title: 'Codex DSH Bridge', backgroundColor: '#fafafa', icon: path.join(here, 'ui', 'icon.png'),
+    title: 'Codex DSH Bridge', backgroundColor: nativeTheme.shouldUseDarkColors ? '#0c0e13' : '#f4f5f8', icon: path.join(here, 'ui', 'icon.png'),
     webPreferences: { preload: path.join(here, 'ui', 'preload.cjs'), nodeIntegration: false, contextIsolation: true, sandbox: true, webSecurity: true },
   });
   win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
@@ -63,7 +63,7 @@ function integration(): { toml: string; launch: string[]; env: Record<string, st
 }
 async function state(): Promise<unknown> {
   const config = integration();
-  const registration = await readRegistration(path.join(process.env.CODEX_HOME ?? path.join(os.homedir(), '.codex'), 'config.toml'), { command: process.execPath, args: config.launch, env: config.env });
+  const registration = await readRegistration(path.join(codexHome(), 'config.toml'), { command: process.execPath, args: config.launch, env: config.env });
   const shownRoot = await realpath(dataRoot).catch(() => dataRoot);
   return { tasks: engine.store.tasks, settings: engine.store.settings,
     busy: engine.isActive(), mcpLastCall, registration, serviceError, dataRoot: shownRoot, version: app.getVersion(), integration: config.toml };
@@ -131,89 +131,97 @@ async function quit(): Promise<void> {
   }
   exiting = true; await engine?.shutdown(); stopPipe?.(); tray?.destroy(); app.quit();
 }
-const methods = new Set(['state', 'saveSettings', 'dshModels', 'pick', 'permission', 'resume', 'revalidate', 'revise', 'cancel', 'openWorktree', 'openDshChat', 'integration', 'installCodex', 'installDshObserver', 'copyTaskId', 'copyIntegration']);
+const codexHome = () => process.env.CODEX_HOME ?? path.join(os.homedir(), '.codex');
+// sha256 (LF line endings) of shipped Skill originals that may be backed up and replaced: 0.1.9 and one verified earlier release.
+const knownSkillOriginals = new Set([
+  '7072ae3ec20c25b6609f659df3731d012712d100e73f7025e204aa0f838f0df3',
+  '2ee799b5dbd64d98cb877f35cab7def1210ef89561b2cc6ec3e0ef93afdc580c',
+]);
+/** Writes the shipped Skill. A different existing file is replaced only when it is a known original; user edits and links are refused. */
+async function installSkill(target: string, content: string): Promise<void> {
+  try {
+    const existing = await readFile(target, 'utf8');
+    if (existing !== content) {
+      const info = await lstat(target);
+      const previous = createHash('sha256').update(existing.replace(/\r\n/g, '\n')).digest('hex');
+      if (info.isSymbolicLink() || info.nlink > 1 || !knownSkillOriginals.has(previous)) throw new Error('已有同名 Skill 且内容不同。请先备份或更名，不会覆盖用户文件。');
+      await copyFile(target, `${target}.bridge-backup-${Date.now()}`);
+    }
+  } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+  await mkdir(path.dirname(target), { recursive: true }); await writeFile(target, content);
+}
+async function installCodex(): Promise<string> {
+  if (integrationBusy) throw new Error('接入配置正在安装，请等待。');
+  integrationBusy = true;
+  try {
+    const config = integration();
+    const configPath = path.join(codexHome(), 'config.toml');
+    let originalConfig = '';
+    try { originalConfig = await readFile(configPath, 'utf8'); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+    const registration = registrationState(originalConfig, { command: process.execPath, args: config.launch, env: config.env });
+    if (registration.status === 'conflict' || registration.status === 'error') throw new Error(registration.message);
+    const skillTarget = path.join(smoke ? dataRoot : os.homedir(), '.agents', 'skills', 'codex-dsh-bridge', 'SKILL.md');
+    await installSkill(skillTarget, await readFile(config.skillSource, 'utf8'));
+    if (registration.status === 'registered') return 'MCP 已注册，Skill 已核对，无需重复安装。请重载 Codex MCP；连接后这里会显示最近调用时间。';
+    if (originalConfig) await copyFile(configPath, `${configPath}.bridge-backup-${Date.now()}`);
+    const args = ['mcp', 'add', 'codex-dsh-bridge'];
+    for (const [key, value] of Object.entries(config.env)) args.push('--env', `${key}=${value}`);
+    args.push('--', process.execPath, ...config.launch);
+    const result = await runProcess(await resolveCodexExecutable(engine.store.settings.codexPath), args, { env: cleanEnvironment({ CODEX_HOME: codexHome() }), timeoutMs: 30000 });
+    if (result.code !== 0) throw new Error('Codex MCP 注册失败。请使用接入页中的手动配置。');
+    // codex mcp add has no timeout flag. Update only the bridge's own new section.
+    const text = await readFile(configPath, 'utf8');
+    const section = /(^\[mcp_servers\.codex-dsh-bridge\]\r?\n)([\s\S]*?)(?=^\[|$(?![\s\S]))/m;
+    if (!section.test(text)) throw new Error('MCP 已注册，但没有定位到超时设置。请在手动配置中设置 tool_timeout_sec = 660。');
+    await writeFile(configPath, text.replace(section, (_match, heading: string, body: string) => heading + body.replace(/^tool_timeout_sec\s*=.*\r?\n/gm, '') + 'tool_timeout_sec = 660\n\n'));
+    return '已安装 MCP 与 Skill。请重新打开 Codex 聊天或重载 MCP，然后使用 $codex-dsh-bridge。';
+  } finally { integrationBusy = false; }
+}
+const taskParams = z.object({ taskId: z.string().uuid(), permissionId: z.string().uuid().optional(), optionId: z.string().nullable().optional(), instruction: z.string().max(16000).optional() }).strict();
+const taskOf = (params: unknown) => engine.task(taskParams.parse(params).taskId);
+/** Every renderer operation. The keys are the allowlist; preload.cjs repeats it because the sandboxed preload cannot import this module. */
+const handlers: Record<string, (params: unknown) => unknown> = {
+  state: () => state(),
+  integration: () => integration().toml,
+  copyIntegration: () => { clipboard.writeText(integration().toml); return 'MCP 配置已复制'; },
+  dshModels: params => getDesktopModels({ ...engine.store.settings, ...settingsSchema.pick({ dshPath: true, dshHome: true }).parse(params) }),
+  saveSettings: async params => {
+    if (engine.isActive()) throw new Error('请等待任务结束后修改运行设置。');
+    const { settings } = z.object({ settings: settingsSchema }).strict().parse(params);
+    if (settings.executionMode === 'desktop' && settings.nativeModel) validateDesktopModel(settings.nativeModel, await getDesktopModels(settings));
+    await engine.store.saveSettings(settings); return state();
+  },
+  pick: async params => {
+    const kind = z.enum(['dsh', 'home']).parse(params);
+    const selected = await dialog.showOpenDialog(win!, { title: kind === 'home' ? '选择 DSH 数据目录（可选）' : '选择 DSH 命令入口', properties: kind === 'home' ? ['openDirectory'] : ['openFile'] });
+    return selected.canceled ? '' : selected.filePaths[0];
+  },
+  installDshObserver: () => installDshObserver(),
+  installCodex: () => installCodex(),
+  permission: async params => {
+    const { taskId, permissionId, optionId } = taskParams.parse(params);
+    await engine.answerPermission(taskId, z.string().uuid().parse(permissionId), z.string().nullable().parse(optionId)); return '已处理权限请求';
+  },
+  resume: params => { const { taskId, instruction } = taskParams.parse(params); return engine.submit({ operation: 'resume', taskId, instruction }); },
+  revise: params => engine.submit({ operation: 'revise', taskId: taskParams.parse(params).taskId }),
+  cancel: params => engine.cancel(taskParams.parse(params).taskId),
+  revalidate: params => engine.revalidate(taskParams.parse(params).taskId),
+  copyTaskId: params => { clipboard.writeText(taskParams.parse(params).taskId); return '任务 ID 已复制'; },
+  openWorktree: async params => {
+    const task = taskOf(params);
+    if (!task.worktree) throw new Error('尚未创建工作目录。');
+    await shell.openPath(task.worktree); return '已打开工作目录';
+  },
+  openDshChat: async params => { await openDesktopChat(taskOf(params), engine.store.settings); return '已请求 DSH 打开原生对话。'; },
+};
 function installIpc(): void {
   ipcMain.handle('bridge:invoke', async (event, input: unknown) => {
     if (!win || event.sender !== win.webContents || event.senderFrame !== win.webContents.mainFrame || !event.senderFrame.url.startsWith(pageUrl)) throw new Error('非法界面请求。');
     const { method, params } = z.object({ method: z.string(), params: z.unknown().optional() }).strict().parse(input);
-    if (!methods.has(method)) throw new Error('未知操作。');
-    try {
-      if (method === 'state') return await state();
-      if (method === 'integration') return integration().toml;
-      if (method === 'copyIntegration') { clipboard.writeText(integration().toml); return 'MCP 配置已复制'; }
-      if (method === 'dshModels') {
-        const paths = settingsSchema.pick({dshPath:true,dshHome:true}).parse(params);
-        return await getDesktopModels({...engine.store.settings,...paths});
-      }
-      if (method === 'saveSettings') {
-        if (engine.isActive()) throw new Error('请等待任务结束后修改运行设置。');
-        const { settings } = z.object({ settings: settingsSchema }).strict().parse(params);
-        if (settings.executionMode === 'desktop' && settings.nativeModel)
-          validateDesktopModel(settings.nativeModel, await getDesktopModels(settings));
-        await engine.store.saveSettings(settings); return await state();
-      }
-      if (method === 'pick') {
-        const kind = z.enum(['dsh', 'home']).parse(params);
-        const selected = await dialog.showOpenDialog(win!, { title: kind === 'home' ? '选择 DSH 数据目录（可选）' : '选择 DSH 命令入口', properties: kind === 'home' ? ['openDirectory'] : ['openFile'] });
-        return selected.canceled ? '' : selected.filePaths[0];
-      }
-      if (method === 'installDshObserver') return await installDshObserver();
-      if (method === 'installCodex') {
-        if (integrationBusy) throw new Error('接入配置正在安装，请等待。');
-        integrationBusy = true;
-        try {
-          const config = integration();
-          const codexHome = process.env.CODEX_HOME ?? path.join(os.homedir(), '.codex');
-          const configPath = path.join(codexHome, 'config.toml');
-          let originalConfig = '';
-          try { originalConfig = await readFile(configPath, 'utf8'); }
-          catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
-          const registration = registrationState(originalConfig, { command:process.execPath, args:config.launch, env:config.env });
-          if (registration.status === 'conflict' || registration.status === 'error') throw new Error(registration.message);
-          const skillTarget = path.join(smoke ? dataRoot : os.homedir(), '.agents', 'skills', 'codex-dsh-bridge', 'SKILL.md');
-          const content = await readFile(config.skillSource, 'utf8');
-          try {
-            const existing = await readFile(skillTarget, 'utf8');
-            if (existing !== content) {
-              const info=await lstat(skillTarget);
-              const previous=createHash('sha256').update(existing.replace(/\r\n/g,'\n')).digest('hex');
-              // 仅这两个已核对的原版摘要可备份升级；用户改动、链接一律拒绝。
-              const knownOriginal=previous==='7072ae3ec20c25b6609f659df3731d012712d100e73f7025e204aa0f838f0df3'||previous==='2ee799b5dbd64d98cb877f35cab7def1210ef89561b2cc6ec3e0ef93afdc580c';
-              if(info.isSymbolicLink()||info.nlink>1||!knownOriginal)throw new Error('已有同名 Skill 且内容不同。请先备份或更名，不会覆盖用户文件。');
-              await copyFile(skillTarget,`${skillTarget}.bridge-backup-${Date.now()}`);
-            }
-          }
-          catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
-          await mkdir(path.dirname(skillTarget), { recursive: true }); await writeFile(skillTarget, content);
-          if (registration.status === 'registered') return 'MCP 已注册，Skill 已核对，无需重复安装。请重载 Codex MCP；连接后这里会显示最近调用时间。';
-          if (originalConfig) await copyFile(configPath, `${configPath}.bridge-backup-${Date.now()}`);
-          const args = ['mcp', 'add', 'codex-dsh-bridge'];
-          for (const [key, value] of Object.entries(config.env)) args.push('--env', `${key}=${value}`);
-          args.push('--', process.execPath, ...config.launch);
-          const result = await runProcess(await resolveCodexExecutable(engine.store.settings.codexPath), args, { env: cleanEnvironment({ CODEX_HOME: codexHome }), timeoutMs: 30000 });
-          if (result.code !== 0) throw new Error('Codex MCP 注册失败。请使用接入页中的手动配置。');
-          // codex mcp add has no timeout flag. Update only the bridge's own new section.
-          const text = await readFile(configPath, 'utf8');
-          const section = /(^\[mcp_servers\.codex-dsh-bridge\]\r?\n)([\s\S]*?)(?=^\[|$(?![\s\S]))/m;
-          if (!section.test(text)) throw new Error('MCP 已注册，但没有定位到超时设置。请在手动配置中设置 tool_timeout_sec = 660。');
-          await writeFile(configPath, text.replace(section, (_match, heading: string, body: string) => heading + body.replace(/^tool_timeout_sec\s*=.*\r?\n/gm, '') + 'tool_timeout_sec = 660\n\n'));
-          return '已安装 MCP 与 Skill。请重新打开 Codex 聊天或重载 MCP，然后使用 $codex-dsh-bridge。';
-        } finally { integrationBusy = false; }
-      }
-      const payload = z.object({ taskId: z.string().uuid(), permissionId: z.string().uuid().optional(), optionId: z.string().nullable().optional(), instruction: z.string().max(16000).optional() }).strict().parse(params);
-      if (method === 'permission') {
-        await engine.answerPermission(payload.taskId, z.string().uuid().parse(payload.permissionId), z.string().nullable().parse(payload.optionId)); return '已处理权限请求';
-      }
-      if (method === 'resume') return await engine.submit({ operation: 'resume', taskId: payload.taskId, instruction: payload.instruction });
-      if (method === 'revise') return await engine.submit({ operation: 'revise', taskId: payload.taskId });
-      if (method === 'cancel') return await engine.cancel(payload.taskId);
-      if (method === 'revalidate') return await engine.revalidate(payload.taskId);
-      if (method === 'copyTaskId') { clipboard.writeText(payload.taskId); return '任务 ID 已复制'; }
-      const task = engine.task(payload.taskId);
-      if (method === 'openWorktree') { if (!task.worktree) throw new Error('尚未创建工作目录。'); await shell.openPath(task.worktree); return '已打开工作目录'; }
-      if (method === 'openDshChat') { await openDesktopChat(task,engine.store.settings); return '已请求 DSH 打开原生对话。'; }
-      throw new Error('未知操作。');
-    } catch (error) { throw new Error(safeError(error)); }
+    if (!Object.hasOwn(handlers, method)) throw new Error('未知操作。');
+    try { return await handlers[method]!(params); }
+    catch (error) { throw new Error(safeError(error)); }
   });
 }
 
@@ -243,158 +251,7 @@ else {
       tray.setContextMenu(Menu.buildFromTemplate([{ label: '打开任务窗口', click: showWindow }, { label: '退出', click: () => { void quit(); } }]));
       Menu.setApplicationMenu(null);
       if (smoke) {
-        if (win!.webContents.isLoadingMainFrame()) await new Promise<void>(resolve => win!.webContents.once('did-finish-load', resolve));
-        await new Promise(resolve => setTimeout(resolve, 500));
-        const result = await win!.webContents.executeJavaScript('({title:document.title, bridge:typeof window.bridge.invoke, text:document.body.innerText})');
-        if (result.bridge !== 'function' || !result.text.includes('任务')) throw new Error('界面启动验证失败。');
-        if (!await win!.webContents.executeJavaScript("document.querySelector('#connection-state').textContent.includes('MCP 已注册')")) throw new Error('已注册 MCP 仍然显示等待接入。');
-        const configFile = path.join(process.env.CODEX_HOME!, 'config.toml');
-        const beforeInstall = await readFile(configFile, 'utf8');
-        const repeated = await win!.webContents.executeJavaScript("window.bridge.invoke('installCodex')");
-        if (!repeated.includes('无需重复安装') || await readFile(configFile, 'utf8') !== beforeInstall) throw new Error('重复接入改写了现有配置。');
-        Object.assign(result, { registeredBeforeCall:true, idempotentInstallation:true });
-        const addonTarget = path.join(dataRoot, 'observer-export');
-        await exportObserver(root, addonTarget, helper);
-        if (JSON.parse(await readFile(path.join(addonTarget, 'package.json'), 'utf8')).name !== '@codex-dsh/desktop-observer') throw new Error('观察插件导出失败。');
-        Object.assign(result, { observerExport:true });
-        const image = await win!.webContents.capturePage();
-        await writeFile(path.join(smokeOutput, 'desktop-preview.png'), image.toPNG());
-        await win!.webContents.executeJavaScript("document.querySelector('[data-page=settings]').click()");
-        if (!await win!.webContents.executeJavaScript("!document.querySelector('#settings-page').classList.contains('hidden')")) throw new Error('设置页面验证失败。');
-        if (!await win!.webContents.executeJavaScript("!document.querySelector('#dshModel,#apiModel,#apiKey,#codexPath,#key-state') && !document.querySelector('#settings-page').textContent.includes('独立付费审查') && !!document.querySelector('#timeoutMinutes')"))
-          throw new Error('设置页仍包含已移除的旧 ACP 模型或付费审查输入。');
-        const physicalRoot = await realpath(dataRoot);
-        if (String(await win!.webContents.executeJavaScript("window.bridge.invoke('state').then(state=>state.dataRoot)")) !== physicalRoot ||
-            !await win!.webContents.executeJavaScript(`document.querySelector('#data-root').textContent.includes(${JSON.stringify(physicalRoot)})`))
-          throw new Error('设置页没有显示数据目录的真实路径。');
-        Object.assign(result, { dataRootResolved:true });
-        const brand = await win!.webContents.executeJavaScript("const mark=document.querySelector('.brand-mark');({tag:mark.tagName,src:mark.getAttribute('src'),width:mark.naturalWidth})");
-        if (brand.tag !== 'IMG' || brand.src !== 'icon.png' || brand.width !== 256) throw new Error('页面品牌图标未使用 icon.png。');
-        const iconPng = await readFile(path.join(here, 'ui', 'icon.png'));
-        const sameIcon = app.isPackaged
-          ? !nativeImage.createFromPath(path.join(here, 'ui', 'icon.png')).isEmpty()
-          : iconPng.equals(await readFile(path.join(root, 'assets', 'icon.png'))) && (await readFile(path.join(root, 'assets', 'icon.ico'))).includes(iconPng);
-        if (!sameIcon) throw new Error(app.isPackaged ? '打包图标无法加载。' : '窗口、托盘与安装包图标不是同一份 PNG 源。');
-        Object.assign(result, { settingsPruned:true, brandIcon:true, singleIconSource:true });
-        const testCatalog = {home:dataRoot,default:{provider:'magpie',model:'group/cheap-first'},groups:[
-          {id:'magpie',name:'Magpie',models:[{id:'group/cheap-first',name:'便宜优先-主用deepseek',reasoning:{efforts:[{id:'high',name:'High'},{id:'max',name:'Max'}],defaultEffort:'high'}}]},
-        ],failures:[]};
-        let unavailableModel = false;
-        const modelPipe = net.createServer(socket => {
-          let input = '';
-          socket.on('data', bytes => {
-            input += bytes.toString(); if (!input.includes('\n')) return;
-            const request = JSON.parse(input);
-            const result = request.method === 'capabilities' ? {nativeChat:true,modelSelection:true} : {...testCatalog,groups:unavailableModel?[]:testCatalog.groups};
-            socket.end(JSON.stringify({id:request.id,result})+'\n');
-          });
-        });
-        const modelPipeAddress = pipePath(pipeName(await identity(helper))+'-desktop');
-        await new Promise<void>((resolve,reject) => {modelPipe.once('error',reject);modelPipe.listen(modelPipeAddress,resolve);});
-        try {
-          const readModels = "(async()=>{const button=document.querySelector('#read-dsh-models');button.click();for(let i=0;i<200&&button.disabled;i++)await new Promise(resolve=>setTimeout(resolve,25));return !button.disabled;})()";
-          await win!.webContents.executeJavaScript(readModels);
-          await win!.webContents.executeJavaScript("const provider=document.querySelector('#nativeProvider');provider.value='magpie';provider.dispatchEvent(new Event('change'));");
-          if(!await win!.webContents.executeJavaScript("document.querySelector('#nativeModelId').value==='group/cheap-first' && document.querySelector('#nativeEffort').value==='max'"))
-            throw new Error('自定义路由或 max 推理强度未正确加载。');
-          const saveModels = "(async()=>{document.querySelector('#toast').textContent='';document.querySelector('#settings-form').requestSubmit();for(let i=0;i<200&&!document.querySelector('#toast').textContent;i++)await new Promise(resolve=>setTimeout(resolve,25));return document.querySelector('#toast').textContent;})()";
-          if(!String(await win!.webContents.executeJavaScript(saveModels)).includes('设置已保存') ||
-              engine.store.settings.nativeModel?.model !== 'group/cheap-first' || engine.store.settings.nativeModel.reasoningEffort !== 'max')
-            throw new Error('模型选择未通过真实界面和受限 IPC 保存。');
-          await writeFile(path.join(smokeOutput,'desktop-model-settings.png'),(await win!.webContents.capturePage()).toPNG());
-          unavailableModel=true;
-          await win!.webContents.executeJavaScript(readModels);
-          if(!await win!.webContents.executeJavaScript("document.querySelector('#nativeModelId').value==='group/cheap-first' && document.querySelector('#dsh-model-status').textContent.includes('不可用')"))
-            throw new Error('已失效模型被静默替换。');
-          if(!String(await win!.webContents.executeJavaScript(saveModels)).includes('不可用'))throw new Error('无效路由未在保存时拒绝。');
-          await win!.webContents.executeJavaScript("document.querySelector('#nativeProvider').value='';document.querySelector('#nativeProvider').dispatchEvent(new Event('change'));");
-          if(!String(await win!.webContents.executeJavaScript(saveModels)).includes('设置已保存') || engine.store.settings.nativeModel !== null)
-            throw new Error('跟随 DSH 默认选项未保存。');
-          Object.assign(result,{modelCatalogIpc:true,customRouteSaved:true,maxEffortSelected:true,unavailableModelPreserved:true,unavailableModelRejected:true,followDefaultSaved:true});
-        } finally {await new Promise<void>(resolve=>modelPipe.close(()=>resolve()));}
-        await win!.webContents.executeJavaScript("document.querySelector('[data-page=integration]').click()");
-        if (!await win!.webContents.executeJavaScript("document.querySelector('#mcp-config').textContent.includes('ELECTRON_RUN_AS_NODE')")) throw new Error('接入页面配置验证失败。');
-        const realDshPath=engine.store.settings.dshPath;
-        const realDshHome=engine.store.settings.dshHome;
-        const mockDshPath=path.join(dataRoot,'mock-dsh.cmd');
-        // Counts plugin runs so a repeated request can be proven not to reinstall.
-        const mockCalls=path.join(dataRoot,'mock-dsh-calls.txt');
-        await writeFile(mockCalls,'');
-        await writeFile(mockDshPath,`@echo off\r\n>>"${mockCalls}" echo call\r\nif not "%~1"=="plugin" exit /b 11\r\nif not "%~2"=="--profile" exit /b 12\r\nif not "%~3"=="desktop" exit /b 13\r\nif not "%~4"=="add" exit /b 14\r\nif not exist "%~5\\native.js" exit /b 15\r\nexit /b 0\r\n`);
-        const calls=async()=> (await readFile(mockCalls,'utf8')).split(/\r?\n/).filter(Boolean).length;
-        const clickInstall="(async()=>{const button=document.querySelector('#install-dsh-observer');button.disabled=false;button.click();for(let i=0;i<200&&button.disabled;i++)await new Promise(resolve=>setTimeout(resolve,25));return !button.disabled&&document.querySelector('#toast').textContent;})()";
-        try {
-          engine.store.settings.dshPath=mockDshPath;
-          const first=String(await win!.webContents.executeJavaScript(clickInstall));
-          if(!first.includes('原生对话连接已安装')||await calls()!==1)throw new Error('DSH 安装按钮未通过受限 IPC 完成一次模拟 CLI 安装。');
-          // Only the wording is checked here: no automatic quit, restart or connection wait is exercised.
-          if(!first.includes('不会自动退出或重启 DSH')||!first.includes('不会强制结束进程'))throw new Error('安装结果未说明不支持自动重启或不强制结束。');
-          // Simulate what `dsh plugin add` leaves behind, then prove the repeat request installs nothing.
-          const connectorTarget=path.join(dataRoot,`dsh-desktop-connector-${app.getVersion()}`);
-          const profileFile=path.join(dataRoot,'mock-dsh-home','profiles','desktop','package.json');
-          engine.store.settings.dshHome=path.join(dataRoot,'mock-dsh-home');
-          await mkdir(path.dirname(profileFile),{recursive:true});
-          const manifest=(bundles:boolean)=>JSON.stringify({dependencies:{'@codex-dsh/desktop-observer':`link:${connectorTarget.replace(/\\/g,'/')}`},
-            ...bundles?{dsh:{profile:{bundles:['@deepseek-ai/dsh-base','@codex-dsh/desktop-observer']}}}:{}});
-          await writeFile(profileFile,manifest(true));
-          const again=String(await win!.webContents.executeJavaScript(clickInstall));
-          if(!again.includes('无需重复安装')||await calls()!==1)throw new Error('重复点击仍重新导出或重新运行插件安装。');
-          // The dependency alone is not an install: a missing bundle entry must fall back to plugin add.
-          await writeFile(profileFile,manifest(false));
-          if(!String(await win!.webContents.executeJavaScript(clickInstall)).includes('已安装')||await calls()!==2)
-            throw new Error('缺少 dsh.profile.bundles 声明时没有恢复安装。');
-          // A damaged file must also be repaired rather than skipped as installed.
-          await writeFile(profileFile,manifest(true));
-          await writeFile(path.join(connectorTarget,'index.js'),'stale');
-          if(!String(await win!.webContents.executeJavaScript(clickInstall)).includes('已安装')||await calls()!==3)
-            throw new Error('已损坏的连接没有被重新安装。');
-          Object.assign(result,{dshInstallButton:true,dshInstallMessageChecked:true,dshReinstallSkipped:true,
-            dshMissingBundleReinstalled:true,dshDamagedConnectorRepaired:true,
-            dshAutoQuitTested:false,dshBusyHostRefusalTested:false,dshRestartTested:false,dshConnectorReadyAfterRestartTested:false});
-        } finally {engine.store.settings.dshPath=realDshPath;engine.store.settings.dshHome=realDshHome;}
-        showWindow(); win!.close();
-        if (win!.isDestroyed() || win!.isVisible()) throw new Error('关闭窗口未正确收起到托盘。');
-        await pipeRequest(helper, 'ping', {}); showWindow();
-        if (!win!.isVisible()) throw new Error('托盘恢复窗口失败。');
-        const second = await runProcess(process.execPath, [...(app.isPackaged ? [] : [root]), '--smoke-test', '--background'], { env: cleanEnvironment({ BRIDGE_SMOKE_OUTPUT: smokeOutput, BRIDGE_SMOKE_DATA: dataRoot }), timeoutMs: 20000 });
-        if (second.code !== 0 || secondInstances !== 1) throw new Error('重复启动单实例验证失败。');
-        const credentialFields = await win!.webContents.executeJavaScript("(async()=>Object.keys(await window.bridge.invoke('state')).filter(key=>/apiConfigured|encryptionAvailable|apiKey/.test(key)))()");
-        if (credentialFields.length) throw new Error('界面状态仍包含凭据相关字段。');
-        Object.assign(result,{noCredentialState:true});
-        engine.store.tasks.push({id:randomUUID(),status:'awaiting_review',createdAt:new Date().toISOString(),updatedAt:new Date().toISOString(),round:0,
-          handoff:{requestId:'smoke-only',title:'模拟任务：验证与审查展示',repoPath:'隔离测试目录',baseCommit:'0'.repeat(40),ready:true,goal:'仅用于窗口显示测试',plan:'此记录没有调用模型，也未修改真实项目',constraints:[],allowedPaths:['value.txt'],validationCommands:['模拟验收命令'],acceptanceCriteria:['界面正确显示报告'],commitMessage:'test: demonstrate task window'},
-          summary:'模拟 ACP 执行完成，等待 Codex 审查。',changedFiles:['value.txt'],checks:[{command:'模拟验收命令',exitCode:0,output:'通过',at:new Date().toISOString()}],
-          review:{verdict:'changes_requested',summary:'模拟审查报告：请核对验收条件。',issues:['此记录仅测试显示效果']},reviewSource:'codex',log:[{at:new Date().toISOString(),kind:'mock',text:'<img src=x onerror="window.__unsafe=true"> 日志应作为纯文本显示'}]});
-        await win!.webContents.executeJavaScript("document.querySelector('[data-page=tasks]').click()");
-        await new Promise(resolve => setTimeout(resolve, 1700));
-        if (!await win!.webContents.executeJavaScript("document.querySelector('#detail').textContent.includes('模拟审查报告') && !window.__unsafe && !document.querySelector('#detail img')")) throw new Error('任务详情或日志安全显示失败。');
-        if (!await win!.webContents.executeJavaScript("!document.querySelector('#detail .actions').textContent.includes('付费') && document.querySelector('#detail').textContent.includes('审查报告')")) throw new Error('任务操作仍包含独立付费审查入口，或历史审查报告未显示。');
-        await writeFile(path.join(smokeOutput,'desktop-task-preview.png'),(await win!.webContents.capturePage()).toPNG());
-        const previewTask=engine.store.tasks.at(-1)!;previewTask.executor='desktop';previewTask.sessionId='session-codex-'+previewTask.id;previewTask.handoff.title='中文原生任务 🧪';
-        await new Promise(resolve=>setTimeout(resolve,1700));
-        await win!.webContents.executeJavaScript("document.querySelector('#detail details summary').click()");
-        await win!.webContents.executeJavaScript("document.querySelector('#detail details pre').scrollTop=60");
-        await new Promise(resolve=>setTimeout(resolve,1700));
-        if(!await win!.webContents.executeJavaScript("document.querySelector('#detail details').open && document.querySelector('#detail details pre').scrollTop===60"))throw new Error('查看交接方案在定时刷新后丢失展开或滚动状态。');
-        await win!.webContents.executeJavaScript("document.querySelector('#detail details summary').click()");
-        await new Promise(resolve=>setTimeout(resolve,1700));
-        if(await win!.webContents.executeJavaScript("document.querySelector('#detail details').open"))throw new Error('手动收起交接方案后被定时刷新重新打开。');
-        Object.assign(result,{handoffRemainsOpen:true,handoffScrollPreserved:true,handoffRemainsClosed:true});
-        if(!await win!.webContents.executeJavaScript("document.querySelector('#detail').textContent.includes('中文原生任务 🧪') && document.querySelector('#detail').textContent.includes('打开 DSH 对话') && !document.querySelector('#detail .logs')"))throw new Error('原生任务界面仍展示聊天日志或中文错误。');
-        let focusError: string;
-        try {
-          engine.store.settings.dshPath=path.join(dataRoot,'absent-dsh','resources/runtime/cli/bin/dsh.cmd');
-          focusError=await win!.webContents.executeJavaScript(`window.bridge.invoke('openDshChat',{taskId:${JSON.stringify(previewTask.id)}}).then(()=>'',error=>error.message)`);
-        } finally {engine.store.settings.dshPath=realDshPath;}
-        if(!focusError.includes('找不到 DSH 桌面程序')||/ENOENT|ECONNREFUSED/.test(focusError))throw new Error('打开 DSH 对话未显示可操作的连接提示。');
-        Object.assign(result,{nativeChatFocusIpc:true});
-        await writeFile(path.join(smokeOutput,'desktop-native-preview.png'),(await win!.webContents.capturePage()).toPNG());
-        Object.assign(result,{nativeTaskUi:true,bridgeChatRemoved:true});
-        if (!String(await win!.webContents.executeJavaScript(`window.bridge.invoke('paidReview',{taskId:${JSON.stringify(previewTask.id)}}).then(()=>'',error=>error.message)`)).includes('未知操作'))
-          throw new Error('受限 IPC 仍允许付费审查入口。');
-        Object.assign(result,{paidReviewRemoved:true,historyReviewVisible:true});
-        Object.assign(result,{settings:true,integration:true,closeToTray:true,restore:true,singleInstance:true,taskDetail:true,textOnlyLogs:true});
-        await writeFile(path.join(smokeOutput, 'desktop-smoke.json'), JSON.stringify(result, null, 2));
+        await runSmoke({ win: win!, engine, dataRoot, root, here, helper, smokeOutput, showWindow, secondInstances: () => secondInstances });
         await engine.shutdown(); stopPipe(); exiting = true; app.exit(0);
       }
     } catch (error) {
