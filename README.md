@@ -8,6 +8,7 @@ Codex 负责规划与审查，DeepSeek Harness（下称 DSH）负责在桌面原
 
 - Windows x64。目前只支持本地项目与串行执行，不提供浏览器状态页或 HTTP 服务。
 - 需要已安装的 DSH 桌面版、Codex CLI，以及可以正常运行 Node.js 工具链的 Git。
+- 验收命令需要 PowerShell 7（`pwsh`），并且 Bridge 进程的 `PATH` 能找到它。它与系统自带的 Windows PowerShell 5.1（`powershell.exe`）是不同程序；缺少 `pwsh` 时会明确报错，不会回退到旧版。
 - 源码开发需要 Node.js 24、Git，以及系统自带的 .NET Framework 4.x 编译器（用于编译管道辅助程序）。
 
 ## 安装

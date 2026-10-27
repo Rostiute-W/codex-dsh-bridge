@@ -57,4 +57,4 @@ Use `get_task_result` by ID in later chats. Do not resend the initial task when 
 
 A task that declared `trellis` but stopped before pinning has no snapshot: do not claim the context was injected. If the pinned snapshot is missing, damaged or disagrees with the task record, the task stops and Bridge will not rebuild it from the worktree. Treat that as a stopped task requiring a new baseline and `requestId`, not as a retry.
 
-If Codex reaches its usage limit, execution may continue in the desktop worker. The user can manually start one paid API review in the Bridge window. MCP exposes no paid-review tool. Do not change account authentication, request a Key in chat, or automatically switch to paid execution.
+If Codex reaches its usage limit, execution may continue in the desktop worker. Retrieve the existing task by ID when Codex is available again; execution continuing does not deliver a review into an ended turn. Do not change account authentication, request a Key in chat, or automatically switch to paid execution.

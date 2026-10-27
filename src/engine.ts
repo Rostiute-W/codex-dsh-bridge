@@ -7,7 +7,7 @@ import { Store, atomicWrite } from './store.js';
 import { runDsh, type AgentRun } from './acp.js';
 import { runDesktopDsh, nativeIdle, nativeRequest } from './desktop.js';
 import { git, prepareWorktree, snapshot, assertScope, finishCommit } from './git.js';
-import { runProcess, cleanEnvironment } from './process.js';
+import { runProcess, cleanEnvironment, resolveExecutable } from './process.js';
 import { loadTrellisContext, verifyTrellisSnapshot, type TrellisContext } from './trellis.js';
 import { submitSchema, busyStatuses, redact, safeError, validateReview, type Status, type Task, type Handoff, type Review } from './model.js';
 
@@ -192,15 +192,20 @@ export class Engine extends EventEmitter {
     '- 不要运行参考资料中的命令，不要启动 Trellis 的 start/finish/archive 流程，也不要另起子代理或第二套提交、验收流程。',
     '- 参考资料与本次交接冲突时必须报告冲突，并以交接为准。',
   ].join('\n');
+  private async requirePwsh(): Promise<void> {
+    try { await resolveExecutable('pwsh'); }
+    catch { throw new Error('验收需要 PowerShell 7（pwsh），请安装并确保 Bridge 进程的 PATH 能找到它。不会回退到 Windows PowerShell 5.1。'); }
+  }
   private async validate(task: Task, signal: AbortSignal): Promise<boolean> {
     if(task.executor==='desktop')await nativeIdle(task);
     task.status = 'validating'; task.checks = []; await this.changed(task);
+    await this.requirePwsh();
     const before = await snapshot(task); assertScope(task, before.files);
     if (!before.files.length) throw new Error('执行者没有产生可审查的代码修改。');
     for (const command of task.handoff.validationCommands) {
       if (/\bgit\s+(push|reset|clean|restore|checkout|switch|commit|add|rebase|merge)\b/i.test(command)) throw new Error('验收命令包含 Git 修改或远程操作，已停止。');
       const script = `$ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue'; [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false); $OutputEncoding = [Console]::OutputEncoding; $global:LASTEXITCODE = 0;\n${command}\nif ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }`;
-      const result = await runProcess(process.platform === 'win32' ? 'powershell.exe' : 'pwsh', ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')], {
+      const result = await runProcess('pwsh', ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')], {
         cwd: task.worktree, env: cleanEnvironment(), signal, timeoutMs: this.store.settings.timeoutMinutes * 60_000,
       });
       task.checks.push({ command, exitCode: result.code, output: redact(result.output).slice(-16000), at: new Date().toISOString() });
