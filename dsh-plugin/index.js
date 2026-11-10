@@ -1,6 +1,6 @@
-import { spawn } from 'node:child_process';
-import { createInterface } from 'node:readline';
-import { randomUUID } from 'node:crypto';
+import net from 'node:net';
+import { createHash } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 
@@ -16,7 +16,7 @@ function modelSelection(value) {
 }
 export async function modelCatalog(ctx) {
   const catalog = await ctx.sessionController.modelCatalog();
-  // Only model metadata crosses the pipe; provider errors can contain secrets.
+  // 管道仅传模型元数据，供应商原始错误可能含凭据。
   return {
     home:path.resolve(process.env.DSH_HOME?.trim() || path.join(os.homedir(),'.dsh')),
     default:modelSelection(catalog.default),
@@ -34,7 +34,7 @@ export async function modelCatalog(ctx) {
   };
 }
 export function nativeFailureMessage(method,error) {
-  const operation=['prepare','send','inspect','focus','cancel','lock','unlock','capabilities','models'].includes(method)?method:'request';
+  const operation=['send','inspect','cancel','models'].includes(method)?method:'request';
   const reasons={
     'session/cwd-conflict':'会话工作目录与任务工作区不一致。',
     'workspace/not-found':'DSH 工作区不存在。',
@@ -51,7 +51,7 @@ export function nativeFailureMessage(method,error) {
   return `DSH 原生操作失败（${operation} / ${code}）：${reasons[code] ?? '请检查连接插件与 DSH 版本及会话状态。'}`;
 }
 export function nativeController(ctx, dataRoot) {
-  const guards=new Map();let focus={seq:0};
+  let focus={seq:0};
   const sessionId=taskId=>'session-codex-'+taskId;
   const state=async taskId=>{
     const id=sessionId(taskId),agent=ctx.agents.get(id);
@@ -67,23 +67,17 @@ export function nativeController(ctx, dataRoot) {
         summary:(message?.data.message?.content ?? message?.data.content ?? []).filter(part=>part.type==='text').map(part=>part.text).join('').slice(-128000)};
     } finally {observation[Symbol.dispose]();}
   };
-  ctx.on('agent/pre-step',(payload,next)=>{
-    const guard=guards.get(payload.agent.id);
-    return guard && guard.until>Date.now() ? Promise.resolve({kind:'reject'}) : next();
-  });
   return {focus:()=>focus,async call(method,params) {
-    if(method==='capabilities')return {protocol:1,nativeChat:true,modelSelection:typeof ctx.sessionController.modelCatalog === 'function' && typeof ctx.sessionController.selectModel === 'function'};
     if(method==='models')return modelCatalog(ctx);
     if(!params||!uuid.test(params.taskId))throw new Error('无效的任务 ID。');
     const id=sessionId(params.taskId);
-    if(method==='send'||method==='prepare') {
+    if(method==='send') {
       const expected=path.join(dataRoot,'tasks',params.taskId,'workspace');
       if(typeof params.cwd!=='string'||path.resolve(params.cwd).toLowerCase()!==path.resolve(expected).toLowerCase()
         ||typeof params.title!=='string'||!params.title.trim()||params.title.length>160)throw new Error('原生交接参数超出范围。');
-      if(method==='send'&&(typeof params.prompt!=='string'||!params.prompt.trim()||params.prompt.length>256000
-        ||typeof params.requestId!=='string'||params.requestId.length>160))throw new Error('原生提示词超出范围。');
-      if(guards.has(id)&&guards.get(id).until>Date.now())throw new Error('会话正在提交审查结果。');
-      const selected = params.nativeModel == null ? undefined : modelSelection(params.nativeModel);
+      if((typeof params.prompt!=='string'||!params.prompt.trim()||params.prompt.length>256000
+        ||typeof params.requestId!=='string'||!params.requestId.trim()||params.requestId.length>160))throw new Error('原生提示词超出范围。');
+      const selected = params.model == null ? undefined : modelSelection(params.model);
       const attached=ctx.agents.get(id);
       await ctx.sessionController.create({sessionId:id,cwd:expected});
       if(!attached)await ctx.sessionController.rename({sessionId:id,title:params.title});
@@ -91,7 +85,7 @@ export function nativeController(ctx, dataRoot) {
         const observation = await ctx.sessionQuery.observeSession(id);
         let alreadySelected;
         try {
-          // Durable events survive connector restarts and preserve human model changes.
+          // 持久事件跨插件重启保留，避免覆盖用户后续选择的模型。
           alreadySelected = observation.events.some(event => event.type === 'model/selection' || event.type === 'user/message');
         } finally {observation[Symbol.dispose]();}
         if (!alreadySelected) {
@@ -104,59 +98,67 @@ export function nativeController(ctx, dataRoot) {
         }
       }
       const before=await state(params.taskId);
-      // Public Host service admission requires the caller's AbortSignal (not
-      // just the request consumed by its internal command implementation).
-      if(method==='send')await ctx.sessionController.prompt({sessionId:id,requestId:params.requestId,content:[{type:'text',text:params.prompt}],mode:'followup',clientTimeZone:'Asia/Shanghai'},new AbortController().signal);
+      // Host 公共服务入口要求调用方提供 AbortSignal。
+      await ctx.sessionController.prompt({sessionId:id,requestId:params.requestId,content:[{type:'text',text:params.prompt}],mode:'followup',clientTimeZone:'Asia/Shanghai'},new AbortController().signal);
       focus={seq:focus.seq+1,sessionId:id};
       return {sessionId:id,beforeSeq:before.cursor};
     }
     if(method==='inspect')return state(params.taskId);
-    if(method==='focus'){focus={seq:focus.seq+1,sessionId:id};return {ok:true};}
-    if(method==='cancel'){ctx.sessionController.cancel({sessionId:id});return {ok:true};}
-    if(method==='lock') {
-      const current=await state(params.taskId);
-      if(guards.has(id)&&guards.get(id).until>Date.now())throw new Error('会话正在提交审查结果。');
-      if(current.status!=='idle'||current.pending||current.cursor!==params.cursor)throw new Error('DSH 已继续执行，必须重新验证。');
-      const token=randomUUID();guards.set(id,{token,until:Date.now()+300000});return {token};
-    }
-    if(method==='unlock'){if(guards.get(id)?.token===params.token)guards.delete(id);return {ok:true};}
+    if(method==='cancel'){await ctx.sessionController.cancel({sessionId:id});return {ok:true};}
     throw new Error('无效的原生会话操作。');
   }};
 }
-export async function startNativePipe(ctx, config, pipe) {
-  const controller=nativeController(ctx,config.dataRoot);
-  let child,reader,retryTimer,stopped=false,initialized=false;
-  const stop=()=>{stopped=true;clearTimeout(retryTimer);reader?.close();child?.stdin.end();child?.kill();};
-  const retry=()=>{
-    if(stopped||retryTimer)return;
-    retryTimer=setTimeout(()=>{retryTimer=undefined;void connect().catch(()=>retry());},1000);
-  };
-  const connect=async()=>{
-    const server=spawn(config.pipeHost,[pipe.split('\\').at(-1)+'-desktop'],{stdio:'pipe',windowsHide:true,env:{SystemRoot:process.env.SystemRoot}});
-    child=server;server.stdin.on('error',()=>{});
-    const lines=createInterface({input:server.stdout});reader=lines;
-    await new Promise((resolve,reject)=>{
-    const timer=setTimeout(()=>reject(new Error('DSH 原生连接启动超时')),10000);
-    const lost=error=>{clearTimeout(timer);lines.close();reject(error);if(initialized&&!stopped)retry();};
-    server.once('error',lost);
-    server.once('exit',()=>lost(new Error('DSH 原生连接退出')));
-    lines.on('line',line=>{
-      let packet;try{packet=JSON.parse(line);}catch{return;}
-      if(packet.ready){clearTimeout(timer);initialized=true;resolve();return;}
-      if(typeof packet.payload!=='string')return;
-      void(async()=>{
-        let id,method;
-        try{const request=JSON.parse(packet.payload);id=request.id;method=request.method;if(!uuid.test(id))throw new Error('无效请求');const result=await controller.call(method,request.params);server.stdin.write(JSON.stringify({client:packet.client,payload:JSON.stringify({id,result})})+'\n');}
-        catch(error){server.stdin.write(JSON.stringify({client:packet.client,payload:JSON.stringify({id,error:nativeFailureMessage(method,error)})})+'\n');}
+
+export const inject = ['webServer', 'connection', 'sessionController', 'sessionQuery', 'agents'];
+export async function apply(ctx) {
+  const config = JSON.parse(readFileSync(new URL('./bridge-config.json', import.meta.url), 'utf8'));
+  if (typeof config.dataRoot !== 'string' || !path.isAbsolute(config.dataRoot)) throw new Error('插件 dataRoot 必须为绝对路径。');
+  const home = path.normalize(path.resolve(process.env.DSH_HOME?.trim() || path.join(os.homedir(), '.dsh'))).toLowerCase();
+  const name = createHash('sha256').update(os.userInfo().username + home).digest('hex').slice(0, 24);
+  const controller = nativeController(ctx, config.dataRoot);
+  const sockets = new Set();
+  const server = net.createServer(socket => {
+    sockets.add(socket);
+    socket.setEncoding('utf8');
+    socket.setTimeout(15000, () => socket.destroy());
+    socket.on('error', () => {});
+    socket.on('close', () => sockets.delete(socket));
+    let data = '', size = 0, received = false;
+    socket.on('data', chunk => {
+      if (received) return;
+      size += Buffer.byteLength(chunk);
+      if (size > 8 * 1024 * 1024) { socket.destroy(); return; }
+      data += chunk;
+      const end = data.indexOf('\n');
+      if (end < 0) return;
+      received = true;
+      void (async () => {
+        let id, method;
+        try {
+          const packet = JSON.parse(data.slice(0, end));
+          id = packet.id; method = packet.method;
+          if (!uuid.test(id) || !['models', 'send', 'inspect', 'cancel'].includes(method)) throw new Error('无效管道请求。');
+          const result = await controller.call(method, packet.params);
+          const response = JSON.stringify({ id, result }) + '\n';
+          if (Buffer.byteLength(response) > 8 * 1024 * 1024) throw new Error('响应过大。');
+          if (!socket.destroyed) socket.end(response);
+        } catch (error) {
+          if (!socket.destroyed) socket.end(JSON.stringify({ id, error: nativeFailureMessage(method, error) }) + '\n');
+        }
       })();
     });
-    }).catch(error=>{server.kill();throw error;});
-  };
-  ctx.effect(()=>stop,'bridge-native:pipe');
-  await connect().catch(error=>{stop();throw error;});
-  ctx.effect(()=>ctx.webServer.register({kind:'exact',path:'/codex-dsh-bridge/native-focus',handler:(req,res)=>{
-    const rejection=ctx.connection.requestRejection(req);if(rejection!==undefined){res.writeHead(rejection);res.end();return;}
-    if(req.method!=='GET'){res.writeHead(405);res.end();return;}
-    res.writeHead(200,{'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store'});res.end(JSON.stringify(controller.focus()));
-  }}),'bridge-native:focus');
+  });
+  ctx.effect(() => () => { for (const socket of sockets) socket.destroy(); server.close(); }, 'bridge-native:pipe');
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(`\\\\.\\pipe\\codex-dsh-${name}`, () => { server.off('error', reject); resolve(); });
+  });
+  server.on('error', () => {});
+  ctx.effect(() => ctx.webServer.register({ kind: 'exact', path: '/codex-dsh-bridge/native-focus', handler: (req, res) => {
+    const rejection = ctx.connection.requestRejection(req);
+    if (rejection !== undefined) { res.writeHead(rejection); res.end(); return; }
+    if (req.method !== 'GET') { res.writeHead(405); res.end(); return; }
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+    res.end(JSON.stringify(controller.focus()));
+  } }), 'bridge-native:focus');
 }

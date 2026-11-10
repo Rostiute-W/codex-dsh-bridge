@@ -1,9 +1,6 @@
 node_modules/
 dist/
 release/
-assets/
-build/pipe-host.exe
-build/mock-reviewer.exe
 .test-data/
 backups/
 *.log

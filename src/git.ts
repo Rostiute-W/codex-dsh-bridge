@@ -1,8 +1,8 @@
-import { readFile, writeFile, mkdir, realpath, lstat } from 'node:fs/promises';
+import { readFile, mkdir, realpath, lstat } from 'node:fs/promises';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { runProcess, cleanEnvironment } from './process.js';
-import type { Task } from './model.js';
+import type { Task } from './engine.js';
 
 export async function git(cwd: string, args: string[]): Promise<string> {
   const result = await runProcess('git', ['-C', cwd, ...args], { env: cleanEnvironment(), timeoutMs: 60_000 });
@@ -12,7 +12,7 @@ export async function git(cwd: string, args: string[]): Promise<string> {
 }
 export function validateRelative(file: string): string {
   const normalized = file.replace(/\\/g, '/').replace(/\/$/, '');
-  if (!normalized || path.isAbsolute(file) || /^[a-z]:/i.test(file) || normalized.split('/').some(p => p === '..' || p === '.' || p === '.git') || /[\0\r\n]/.test(file)) throw new Error(`无效的任务相对路径：${file}`);
+  if (!normalized || path.isAbsolute(file) || normalized.split('/').some(part => !part || part === '..' || part === '.' || part.toLowerCase() === '.git' || /[. ]$/.test(part)) || /[:\0-\x1f]/.test(file)) throw new Error(`无效的任务相对路径：${file}`);
   return normalized;
 }
 export async function prepareWorktree(task: Task, taskDir: string): Promise<void> {
@@ -28,7 +28,6 @@ export async function prepareWorktree(task: Task, taskDir: string): Promise<void
   task.worktree = path.join(taskDir, 'workspace');
   task.branch = `agent/dsh-${task.id.slice(0, 8)}`;
   await git(repo, ['worktree', 'add', '-b', task.branch, task.worktree, head]);
-  await writeFile(path.join(taskDir, 'handoff.json'), JSON.stringify(task.handoff, null, 2));
 }
 export async function snapshot(task: Task, allowStaged = false): Promise<{ files: string[]; fingerprint: string; diff: string }> {
   if (!task.worktree) throw new Error('任务尚未建立 worktree。');
@@ -45,10 +44,8 @@ export async function snapshot(task: Task, allowStaged = false): Promise<{ files
     diff += extra.stdout;
     if (diff.length > 2_000_000) throw new Error('变更超过安全上限，请拆分任务。');
   }
-  // Fingerprint the filesystem state; staging a new file must not change its identity.
+  // 指纹绑定文件系统内容，暂存新增文件不会改变其身份。
   hash.update(task.handoff.baseCommit);
-  // 审批同时绑定代码与固定的 Trellis 上下文：快照被替换或损坏时指纹一起变化。
-  if (task.trellis) hash.update(JSON.stringify([task.trellis.sha256, task.trellis.taskPath, task.trellis.baseCommit]));
   for (const file of files) {
     validateRelative(file);
     const target = path.join(task.worktree, file);
@@ -65,7 +62,7 @@ export function assertScope(task: Task, files: string[]): void {
   const roots = task.handoff.allowedPaths.map(validateRelative);
   for (const file of files) {
     if (!roots.some(root => file === root || file.startsWith(root + '/'))) throw new Error(`变更超出方案范围：${file}`);
-    if (/(^|\/)(\.env(?:\..*)?|auth\.json|\.credentials\.yaml)$|\.(pem|p12|pfx|key)$/i.test(file)) throw new Error(`拒绝提交可能的凭据文件：${file}`);
+    if (/(^|\/)(\.env(?:\..*)?|auth\.json|\.?credentials?(?:\..*)?|\.npmrc|\.netrc|\.git-credentials|id_(?:rsa|ed25519|ecdsa|dsa))$|\.(pem|p12|pfx|key|keystore|jks)$/i.test(file)) throw new Error(`拒绝提交可能的凭据文件：${file}`);
   }
 }
 export async function finishCommit(task: Task): Promise<void> {
@@ -90,7 +87,7 @@ export async function finishCommit(task: Task): Promise<void> {
   const expectedTree = await git(task.worktree!, ['write-tree']);
   await git(task.worktree!, ['commit', '-m', task.handoff.commitMessage]);
   task.commit = await git(task.worktree!, ['rev-parse', 'HEAD']);
-  task.commitStatus = await git(task.worktree!, ['status', '--short']);
+  const commitStatus = await git(task.worktree!, ['status', '--short']);
   if (await git(task.worktree!, ['rev-parse', 'HEAD^{tree}']) !== expectedTree) throw new Error('Git hook 修改了已审查的提交内容。提交哈希已保留，请人工检查。');
-  if (task.commitStatus) throw new Error('提交后工作区还有修改，请人工检查。');
+  if (commitStatus) throw new Error('提交后工作区还有修改，请人工检查。');
 }

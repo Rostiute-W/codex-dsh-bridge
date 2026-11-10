@@ -1,352 +1,352 @@
-import { EventEmitter } from 'node:events';
-import { randomUUID } from 'node:crypto';
-import { appendFile, lstat, mkdir, writeFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { writeFile, access } from 'node:fs/promises';
 import path from 'node:path';
-import type { RequestPermissionRequest, RequestPermissionResponse } from '@agentclientprotocol/sdk';
-import { Store, atomicWrite } from './store.js';
-import { runDsh, type AgentRun } from './acp.js';
-import { runDesktopDsh, nativeIdle, nativeRequest } from './desktop.js';
-import { git, prepareWorktree, snapshot, assertScope, finishCommit } from './git.js';
-import { runProcess, cleanEnvironment, resolveExecutable } from './process.js';
-import { loadTrellisContext, verifyTrellisSnapshot, type TrellisContext } from './trellis.js';
-import { submitSchema, busyStatuses, redact, safeError, validateReview, type Status, type Task, type Handoff, type Review } from './model.js';
+import { setTimeout as delay } from 'node:timers/promises';
+import { z } from 'zod';
+import { Store } from './store.js';
+import { dsh, parseModel, validateModel, type DshClient, type NativeState } from './dsh.js';
+import { prepareWorktree, snapshot, assertScope, finishCommit } from './git.js';
+import { cleanEnvironment, runProcess } from './process.js';
 
-// wait() returns once a task leaves these; awaiting_permission also returns so Codex can tell the user.
-const waitingStatuses = new Set<Status>(['queued', 'preparing', 'running', 'validating', 'review_running', 'committing']);
-const revalidatableStatuses = new Set<Status>(['needs_attention', 'awaiting_review', 'needs_changes', 'cancelled']);
-const runAgent: AgentRun = (...args) => (args[0].executor === 'desktop' ? runDesktopDsh : runDsh)(...args);
-export class Engine extends EventEmitter {
-  private active?: { id: string; controller: AbortController };
-  private permissionAnswers = new Map<string, (response: RequestPermissionResponse) => void>();
-  private instructions = new Map<string, string>();
-  private persistenceTimer?: NodeJS.Timeout;
-  private stopping = false;
-  constructor(readonly store: Store, private readonly agentRun: AgentRun = runAgent) { super(); }
-  async recover(): Promise<void> {
-    for (const task of this.store.tasks) {
-      if (busyStatuses.has(task.status) || task.status === 'queued') {
-        task.status = 'needs_attention'; task.error = '上次运行中断。现场已保留；请明确选择恢复或重新验证，未自动重发任务。';
-        delete task.permission;
-        if (task.worktree) {
-          try {
-            const head = await git(task.worktree, ['rev-parse', 'HEAD']);
-            if (head !== task.handoff.baseCommit) task.error += ` 当前 HEAD 为 ${head}；若提交已经产生，请人工核对，勿重复提交。`;
-          } catch { task.error += ' 工作目录不可用，请检查磁盘或 Git worktree。'; }
-        }
-      }
-    }
-    await this.store.save();
+export const handoffSchema = z.object({
+  requestId: z.string().min(8).max(160), title: z.string().min(1).max(160),
+  repoPath: z.string().min(1).max(2000), baseCommit: z.string().regex(/^[a-f0-9]{40,64}$/i), ready: z.literal(true),
+  goal: z.string().min(10).max(16000), plan: z.string().min(20).max(64000),
+  constraints: z.array(z.string().max(4000)).max(40),
+  allowedPaths: z.array(z.string().min(1).max(1000)).min(1).max(80),
+  validationCommands: z.array(z.string().min(1).max(4000)).min(1).max(20),
+  acceptanceCriteria: z.array(z.string().min(1).max(4000)).min(1).max(40),
+  commitMessage: z.string().min(8).max(180), model: z.string().max(800).optional(),
+}).strict();
+export const reviewSchema = z.object({
+  verdict: z.enum(['approved', 'changes_requested']), summary: z.string().min(1).max(16000),
+  issues: z.array(z.string().min(1).max(8000)).max(50),
+}).strict();
+const submitSchema = z.discriminatedUnion('operation', [
+  z.object({ operation: z.literal('execute'), handoff: handoffSchema }).strict(),
+  z.object({ operation: z.literal('review'), taskId: z.string().uuid(), fingerprint: z.string().regex(/^[a-f0-9]{64}$/i), review: reviewSchema }).strict(),
+  z.object({ operation: z.literal('resume'), taskId: z.string().uuid(), instruction: z.string().min(1).max(16000) }).strict(),
+]);
+export type Handoff = z.infer<typeof handoffSchema>;
+export type Review = z.infer<typeof reviewSchema>;
+export type Status = 'running' | 'validating' | 'awaiting_review' | 'needs_changes' | 'needs_attention' | 'completed' | 'cancelled';
+export interface Task {
+  id: string; handoff: Handoff; status: Status; deadline: number;
+  worktree?: string; branch?: string; sessionId?: string; beforeSeq: number; cursor?: number;
+  round: number; summary: string; guidance: { seq: number; text: string }[];
+  checks: { command: string; exitCode: number; output: string; at: string }[];
+  changedFiles: string[]; fingerprint?: string; diffPath?: string;
+  review?: Review; reviewedFingerprint?: string; commit?: string; error?: string; model?: string;
+}
+export function redact(text: string): string {
+  return text.replace(/\b(?:sk|ds)[-_][a-zA-Z0-9_-]{16,}\b/g, '[已隐藏凭据]')
+    .replace(/((?:api[_-]?key|access[_-]?token|authorization)\s*[:=]\s*)([^\s,;]+)/gi, '$1[已隐藏凭据]');
+}
+export function safeError(error: unknown): string {
+  return redact(error instanceof Error ? error.message : String(error)).slice(0, 4000);
+}
+const running = (task: Task) => task.status === 'running' || task.status === 'validating';
+
+export class Engine {
+  private readonly drivers = new Map<string, { controller: AbortController; done: Promise<void> }>();
+  private readonly timeoutMs: number;
+  constructor(readonly store = new Store(), private readonly client: DshClient = dsh) {
+    const minutes = Number(process.env.BRIDGE_TIMEOUT_MINUTES ?? 300);
+    if (!Number.isFinite(minutes) || minutes <= 0) throw new Error('BRIDGE_TIMEOUT_MINUTES 必须为正数。');
+    this.timeoutMs = minutes * 60_000;
   }
-  task(id: string): Task {
-    const task = this.store.tasks.find(t => t.id === id);
+
+  async task(id: string): Promise<Task> {
+    const task = await this.store.load(id);
     if (!task) throw new Error('找不到任务。');
     return task;
   }
-  isActive(): boolean { return !!this.active || this.store.tasks.some(t => t.status === 'queued' || t.status === 'committing'); }
-  private async changed(task: Task): Promise<void> {
-    task.updatedAt = new Date().toISOString(); this.emit('change'); await this.store.save();
-  }
-  log(task: Task, kind: string, text: string): void {
-    const record = { at: new Date().toISOString(), kind, text: redact(text).slice(0, 16000) };
-    task.log.push(record); if (task.log.length > 800) task.log.splice(0, task.log.length - 800);
-    void mkdir(this.store.taskDir(task.id), { recursive: true }).then(() => appendFile(path.join(this.store.taskDir(task.id), 'execution.jsonl'), JSON.stringify(record) + '\n')).catch(() => {});
-    this.emit('change');
-    if (!this.persistenceTimer) this.persistenceTimer = setTimeout(() => { this.persistenceTimer = undefined; void this.store.save().catch(error => this.emit('persistence-error', safeError(error))); }, 400);
-  }
+
   async submit(value: unknown): Promise<Task> {
-    if (this.stopping) throw new Error('软件正在退出，请稍后重新连接。');
     const request = submitSchema.parse(value);
+    if (redact(JSON.stringify(request)) !== JSON.stringify(request)) throw new Error('交接或审查内容可能包含凭据，请移除后提交。');
     if (request.operation === 'execute') return this.create(request.handoff);
-    const task = this.task(request.taskId);
-    if (request.operation === 'review') return this.acceptReview(task, request.fingerprint, request.review, 'codex');
-    if (request.operation === 'revise') return this.revise(task);
-    if (request.operation === 'revalidate') return this.revalidate(task.id);
-    return this.resume(task, request.instruction);
-  }
-  private async create(handoff: Handoff): Promise<Task> {
-    const duplicate = this.store.tasks.find(t => t.handoff.requestId === handoff.requestId);
-    if (duplicate) {
-      if (JSON.stringify(duplicate.handoff) !== JSON.stringify(handoff)) throw new Error('requestId 已用于不同的交接内容。请使用新的 ID。');
-      return duplicate;
-    }
-    const serialized = JSON.stringify(handoff);
-    if (redact(serialized) !== serialized) throw new Error('交接内容可能包含凭据，请移除后提交。');
-    const task: Task = {
-      id: randomUUID(), handoff, status: 'queued', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
-      round: 0, summary: '', checks: [], changedFiles: [], log: [], executor: this.store.settings.executionMode,
-      ...(this.store.settings.executionMode === 'desktop' ? { nativeModel: this.store.settings.nativeModel ? {...this.store.settings.nativeModel} : null } : {}),
-    };
-    this.store.tasks.unshift(task); await this.changed(task); void this.pump(); return task;
-  }
-  private async pump(): Promise<void> {
-    if (this.active || this.stopping) return;
-    const task = [...this.store.tasks].reverse().find(t => t.status === 'queued');
-    if (!task) return;
-    const controller = new AbortController(); this.active = { id: task.id, controller };
-    const timer = setTimeout(() => controller.abort('timeout'), this.store.settings.timeoutMinutes * 60_000);
+    const release = await this.store.lock(request.taskId);
+    if (!release) throw new Error('任务正在由其他操作驱动，请稍后重试。');
+    let task: Task | undefined;
+    let restart = false;
     try {
-      task.status = 'preparing'; delete task.error; await this.changed(task);
-      if (!task.worktree) await prepareWorktree(task, this.store.taskDir(task.id));
-      // 首次发送前固定 Trellis 上下文：此时 worktree 仍是 baseCommit 的干净副本。
-      if (task.handoff.trellis) await this.pinTrellis(task);
-      for (let attempt = 0; attempt <= 2; attempt++) {
-        // 每次发送都经过同一个入口：初始、自动返工、审查返工与恢复共用同一份固定上下文。
-        const instruction = await this.withTrellis(task, this.instructions.get(task.id) ?? this.initialPrompt(task));
-        this.instructions.delete(task.id);
-        task.status = 'running'; await this.changed(task);
-        task.summary = await this.agentRun(task, this.store.settings, instruction, {
-          log: (kind, text) => this.log(task, kind, text),
-          session: async (id, capabilities) => { task.sessionId = id; task.capabilities = capabilities; await this.changed(task); },
-          permission: params => this.requestPermission(task, params),
-        }, controller.signal);
-        if (controller.signal.aborted) throw new Error('执行已取消或超时。');
-        const passed = await this.validate(task, controller.signal);
-        if (passed) { task.status = 'awaiting_review'; await this.changed(task); break; }
-        if (task.executor === 'desktop' && task.nativeGuidance?.length) {
-          task.status = 'needs_changes';
-          task.error = 'DSH 中已有用户引导，当前验收未通过。已停止自动返工，请 Codex 结合 nativeGuidance 判断方案与验收是否需要调整。';
-          await this.changed(task); break;
+      task = await this.task(request.taskId);
+      if (request.operation === 'review') {
+        if (task.status !== 'awaiting_review') throw new Error('任务不在等待审查状态。');
+        if (request.fingerprint !== task.fingerprint) throw new Error('审查指纹不符，请审查当前版本。');
+        if (request.review.verdict === 'approved' && request.review.issues.length) throw new Error('通过审查不能包含待修复问题。');
+        if (request.review.verdict === 'changes_requested' && !request.review.issues.length) throw new Error('要求修改时必须提供具体问题。');
+        await this.idle(task);
+        const current = await snapshot(task);
+        assertScope(task, current.files);
+        if (current.fingerprint !== request.fingerprint) throw new Error('当前快照指纹不符，请重新等待验收和审查。');
+        if (task.checks.length !== task.handoff.validationCommands.length || task.checks.some(check => check.exitCode !== 0)) throw new Error('验收尚未全部通过。');
+        if (request.review.verdict === 'changes_requested') {
+          if (task.round >= 2) throw new Error('已达到两轮自动与审查返工上限。');
+          task.review = request.review;
+          task.round++;
+          await this.send(task, '按以下审查意见修复，保持原方案与 allowedPaths，不暂存、不提交：\n' + JSON.stringify(request.review));
+          restart = true;
+        } else {
+          task.review = request.review;
+          task.reviewedFingerprint = request.fingerprint;
+          try {
+            await finishCommit(task);
+            task.status = 'completed';
+            delete task.error;
+          } catch (error) { task.status = 'needs_attention'; task.error = safeError(error); }
         }
-        if (attempt >= 2 || task.round >= 2) { task.status = 'needs_changes'; task.error = '自动验证仍未通过。请查看检查记录并人工决定下一步。'; await this.changed(task); break; }
-        task.round++; this.instructions.set(task.id, '修复以下真实验证失败，保持原方案范围，不提交、不暂存、不更改 Git 历史：\n' + JSON.stringify(task.checks.filter(c => c.exitCode !== 0)));
+      } else {
+        if (!['needs_attention', 'needs_changes', 'cancelled'].includes(task.status)) throw new Error('只有待处理、待修改或已取消的任务可以恢复。');
+        if (!task.worktree) await prepareWorktree(task, this.store.taskDir(task.id));
+        else await snapshot(task);
+        task.deadline = Date.now() + this.timeoutMs;
+        delete task.review;
+        await this.send(task, this.initialPrompt(task) + '\n明确恢复指令：\n' + request.instruction);
+        restart = true;
       }
+      await this.store.save(task);
+      return task;
     } catch (error) {
-      task.status = controller.signal.aborted ? (controller.signal.reason === 'timeout' ? 'needs_attention' : 'cancelled') : 'needs_attention';
-      task.error = (controller.signal.reason === 'timeout' ? '任务超过运行时限，现场已保留。' : '') + safeError(error); this.log(task, 'error', task.error); await this.changed(task);
+      // 校验拒绝保持原状态；发送失败则保留现场并停止驱动。
+      if (task && running(task)) {
+        task.status = 'needs_attention'; task.error = safeError(error); await this.store.save(task);
+      }
+      throw error;
     } finally {
-      clearTimeout(timer); this.cancelPermissions(task); this.active = undefined; this.emit('change'); void this.pump();
+      await release();
+      if (restart && task) await this.start(task.id);
     }
   }
-  /** 元数据与交接、任务目录一致，且固定副本仍然完好；否则明确停止。返回核验过的上下文。 */
-  private async verifyPin(task: Task): Promise<TrellisContext> {
-    if (!task.trellis) throw new Error('任务声明了 Trellis 交接，但缺少固定的上下文快照，已停止；请人工核对现场。');
-    if (!task.handoff.trellis) throw new Error('任务记录含 Trellis 上下文，但交接没有引用 Trellis；请人工核对现场。');
-    if (task.trellis.taskPath !== task.handoff.trellis.taskPath
-      || task.trellis.baseCommit.toLowerCase() !== task.handoff.baseCommit.toLowerCase()
-      || task.trellis.snapshotPath !== path.join(this.store.taskDir(task.id), 'trellis-context.json')) {
-      throw new Error('Trellis 上下文元数据与交接或任务目录不一致，已停止。请人工核对现场。');
+
+  private async create(handoff: Handoff): Promise<Task> {
+    const digest = createHash('sha256').update(handoff.requestId).digest('hex');
+    const id = `${digest.slice(0, 8)}-${digest.slice(8, 12)}-4${digest.slice(13, 16)}-a${digest.slice(17, 20)}-${digest.slice(20, 32)}`;
+    const existing = await this.store.load(id);
+    if (existing) return this.duplicate(existing, handoff);
+    const release = await this.store.lock(id);
+    if (!release) {
+      const concurrent = await this.store.load(id);
+      if (concurrent) return this.duplicate(concurrent, handoff);
+      throw new Error('同一 requestId 正在创建，请重试原交接。');
     }
-    return verifyTrellisSnapshot(task.trellis);
-  }
-  /**
-   * 只在基准 worktree 上加载一次，再把完整上下文写成 Bridge 数据目录里的固定副本。
-   * 已存在则复用并核验；缺失或损坏一律报错，绝不从执行者改过的项目文件重新加载。
-   */
-  private async pinTrellis(task: Task): Promise<void> {
-    const taskPath = task.handoff.trellis!.taskPath;
-    const snapshotPath = path.join(this.store.taskDir(task.id), 'trellis-context.json');
-    if (task.trellis) { await this.verifyPin(task); return; }
-    if (!task.worktree) throw new Error('任务尚未建立 worktree，无法读取 Trellis 上下文。');
-    // 快照文件已存在却没有元数据：可能是中断在写盘与记账之间，不能悄悄重新加载。
+    let task: Task | undefined;
     try {
-      await lstat(snapshotPath);
-      throw new Error('Trellis 固定快照已存在但任务记录缺少元数据，请人工核对现场，不会重新加载。');
-    } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
-    const context = await loadTrellisContext(task.worktree, taskPath, task.handoff.baseCommit);
-    // 快照正文会交给模型；写盘前用既有 redact 拦住明显凭据。
-    const serialized = JSON.stringify(context);
-    if (redact(serialized) !== serialized) throw new Error('Trellis 上下文可能包含凭据，已停止；请先从任务资料中移除。');
-    await atomicWrite(snapshotPath, context);
-    task.trellis = {
-      taskPath: context.taskPath, baseCommit: context.baseCommit, sha256: context.sha256, snapshotPath,
-      files: context.files.map(file => ({ path: file.path, sha256: file.sha256, roles: file.roles })),
-    };
-    await this.changed(task);
-    this.log(task, 'trellis', `已固定 Trellis 上下文 ${context.taskPath}：${context.files.length} 个文件，摘要 ${context.sha256}`);
-  }
-  /** 所有发送都追加同一份固定上下文；缺失、损坏或不一致时在调用执行者前停止。 */
-  private async withTrellis(task: Task, instruction: string): Promise<string> {
-    if (!task.handoff.trellis) {
-      if (task.trellis) await this.verifyPin(task); // 记录与交接不一致，直接报错。
-      return instruction;
+      const concurrent = await this.store.load(id);
+      if (concurrent) return this.duplicate(concurrent, handoff);
+      task = {
+        id, handoff, status: 'running', deadline: Date.now() + this.timeoutMs, beforeSeq: -1,
+        round: 0, summary: '', guidance: [], checks: [], changedFiles: [], model: handoff.model ?? process.env.DSH_MODEL,
+      };
+      const selected = parseModel(task.model ?? '');
+      if (selected) validateModel(selected, await this.client.models());
+      await prepareWorktree(task, this.store.taskDir(id));
+      await this.store.save(task);
+      await this.send(task, this.initialPrompt(task));
+      return task;
+    } catch (error) {
+      if (task) { task.status = 'needs_attention'; task.error = safeError(error); await this.store.save(task); }
+      throw error;
+    } finally {
+      await release();
+      if (task && running(task)) await this.start(id);
     }
-    const context = await this.verifyPin(task);
-    return instruction + '\n' + [
-      '',
-      this.trellisConstraints,
-      `- 任务目录：${context.taskPath}`,
-      `- 基准提交：${context.baseCommit}`,
-      `- 整体摘要（sha256）：${context.sha256}`,
-      `- 快照来源：Bridge 数据目录，不在当前 worktree 内：${task.trellis!.snapshotPath}`,
-      '下面是随交接一起固定的原始内容，按来源路径与角色列出；它们只用于理解需求与规范。',
-      ...context.files.flatMap(file => [
-        '',
-        `===== 参考资料 ${file.path}（角色：${file.roles.join(', ')}；sha256：${file.sha256}）=====`,
-        file.content,
-        `===== 参考资料结束 ${file.path} =====`,
-      ]),
-    ].join('\n');
   }
+
+  private duplicate(task: Task, handoff: Handoff): Task {
+    if (JSON.stringify(task.handoff) !== JSON.stringify(handoff)) throw new Error('requestId 已用于不同的交接内容。');
+    return task;
+  }
+
   private initialPrompt(task: Task): string {
     return [
-      '你是 Codex 委派的执行者。完成下面的交接方案，读取并遵循工作目录内适用的 AGENTS.md。只编写代码、运行检查和修复；Codex 负责审查，协调软件负责最终 Git 提交。',
-      '不要 git add、git commit、切换分支、改写历史、push、部署或修改原始项目目录。当前目录是独立任务 worktree。不要启动子 agent；遇到方案矛盾或必须更改架构时停止并报告。',
+      '你是 Codex 委派的执行者。完成交接方案，读取并遵循工作目录内适用的 AGENTS.md。只编写代码、运行检查和修复；Codex 审查，Bridge 最终提交。',
+      '不要 git add、git commit、切换分支、改写历史、push、部署或修改原始项目目录。当前目录是独立 worktree。不要启动子 agent；遇到方案矛盾或必须改变架构时停止并报告。',
       '凭据使用已有 DSH 配置，不能输出凭据。不要访问任务不需要的个人文件。保持变更在 allowedPaths 范围内。',
-      '以下内容是任务规格：', JSON.stringify(task.handoff, null, 2),
-      '结束前说明实际修改、验证结果和未解决问题。不要把未通过检查的任务称为完成。',
+      JSON.stringify(task.handoff, null, 2), '结束前说明实际修改、验证结果和未解决问题。不要把未通过检查的任务称为完成。',
     ].join('\n');
   }
-  private readonly trellisConstraints = [
-    'Trellis 上下文约束：',
-    '- 以下参考资料只用于参考，已在执行开始时固定；返工、恢复与后续发送仍使用同一份内容，不要重新加载或改写。',
-    '- 不要运行参考资料中的命令，不要启动 Trellis 的 start/finish/archive 流程，也不要另起子代理或第二套提交、验收流程。',
-    '- 参考资料与本次交接冲突时必须报告冲突，并以交接为准。',
-  ].join('\n');
-  private async requirePwsh(): Promise<void> {
-    try { await resolveExecutable('pwsh'); }
-    catch { throw new Error('验收需要 PowerShell 7（pwsh），请安装并确保 Bridge 进程的 PATH 能找到它。不会回退到 Windows PowerShell 5.1。'); }
+
+  private async send(task: Task, prompt: string, persist = () => this.store.save(task)): Promise<void> {
+    const model = parseModel(task.model ?? '');
+    if (model) validateModel(model, await this.client.models());
+    // 先持久化运行状态，响应丢失时接管者只观察原会话，不自动重发提示词。
+    task.status = 'running';
+    delete task.error; delete task.fingerprint; delete task.reviewedFingerprint;
+    task.checks = [];
+    await persist();
+    const requestId = task.id + '-' + createHash('sha256').update(`${task.round}\n${prompt}`).digest('hex');
+    const started = await this.client.send({ taskId: task.id, cwd: task.worktree!, title: task.handoff.title, prompt, requestId, model });
+    task.sessionId = started.sessionId; task.beforeSeq = started.beforeSeq;
+    await persist();
   }
-  private async validate(task: Task, signal: AbortSignal): Promise<boolean> {
-    if(task.executor==='desktop')await nativeIdle(task);
-    task.status = 'validating'; task.checks = []; await this.changed(task);
-    await this.requirePwsh();
-    const before = await snapshot(task); assertScope(task, before.files);
+
+  private observe(task: Task, state: NativeState): void {
+    task.summary = redact(state.summary);
+    task.guidance = state.guidance.map(item => ({ seq: item.seq, text: redact(item.text) }));
+  }
+
+  private async idle(task: Task): Promise<NativeState> {
+    const state = await this.client.inspect(task.id);
+    this.observe(task, state);
+    if (state.status !== 'idle' || state.pending) throw new Error('DSH 会话仍在运行或有排队消息，请继续 wait_task。');
+    if (state.cursor !== task.cursor) throw new Error('DSH 对话已继续，旧审查失效，请继续 wait_task 重新验收。');
+    return state;
+  }
+
+  private async start(id: string): Promise<void> {
+    if (this.drivers.has(id)) return;
+    const release = await this.store.lock(id);
+    if (!release) return;
+    let handedOff = false;
+    try {
+      const task = await this.task(id);
+      if (task.status === 'awaiting_review') {
+        const state = await this.client.inspect(id);
+        if (state.cursor === task.cursor && state.status === 'idle' && !state.pending) return;
+        this.observe(task, state);
+        task.beforeSeq = task.cursor ?? -1;
+        task.cursor = state.cursor;
+        task.status = state.status === 'idle' && !state.pending ? 'validating' : 'running';
+        delete task.fingerprint; delete task.review; delete task.reviewedFingerprint;
+        await this.store.save(task);
+      }
+      if (!running(task)) return;
+      const controller = new AbortController();
+      const done = this.drive(task, controller).finally(async () => {
+        try { await release(); } finally { this.drivers.delete(id); }
+      });
+      this.drivers.set(id, { controller, done });
+      handedOff = true;
+      void done.catch(error => console.error(safeError(error)));
+    } catch (error) {
+      const task = await this.task(id);
+      task.status = 'needs_attention'; task.error = safeError(error); await this.store.save(task);
+    } finally { if (!handedOff) await release(); }
+  }
+
+  private async drive(task: Task, controller: AbortController): Promise<void> {
+    const remaining = task.deadline - Date.now();
+    const timer = setTimeout(() => controller.abort('timeout'), Math.max(1, Math.min(remaining, 2_147_483_647)));
+    const persist = async () => {
+      if (controller.signal.aborted || (await this.task(task.id)).status === 'cancelled') throw new Error('执行已取消或超时。');
+      await this.store.save(task);
+    };
+    try {
+      if (remaining <= 0) throw new Error('任务超过总运行时限，现场已保留。');
+      while (running(task)) {
+        if ((await this.task(task.id)).status === 'cancelled') return;
+        if (controller.signal.aborted) throw new Error('执行已取消或超时。');
+        if (task.status === 'running') {
+          const state = await this.client.inspect(task.id);
+          this.observe(task, state);
+          if (state.status !== 'idle' || state.pending || state.endSeq <= task.beforeSeq) {
+            await delay(1500, undefined, { signal: controller.signal }); continue;
+          }
+          if (state.reason !== 'completed') throw new Error(`DSH 未正常完成（${state.reason ?? 'unknown'}），现场已保留。`);
+          task.cursor = state.cursor; task.status = 'validating';
+          await persist();
+        }
+        const passed = await this.validate(task, controller.signal, persist);
+        if (passed) { task.status = 'awaiting_review'; await persist(); return; }
+        if (task.guidance.length) {
+          task.status = 'needs_changes'; task.error = 'DSH 中已有用户引导，验收未通过。请结合 guidance 判断方向与验收要求，已停止自动返工。';
+        } else if (task.round >= 2) {
+          task.status = 'needs_changes'; task.error = '已达到两轮自动与审查返工上限，验收仍未通过。';
+        } else {
+          task.round++;
+          await persist();
+          await this.send(task, '修复以下真实验收失败，保持原方案与 allowedPaths，不暂存、不提交：\n' + JSON.stringify(task.checks.filter(check => check.exitCode !== 0)), persist);
+          continue;
+        }
+        await persist();
+      }
+    } catch (error) {
+      if (controller.signal.reason === 'cancelled' || (await this.task(task.id)).status === 'cancelled') return;
+      task.status = 'needs_attention';
+      task.error = controller.signal.reason === 'timeout' ? '任务超过总运行时限，现场已保留。' : safeError(error);
+      await this.store.save(task);
+    } finally { clearTimeout(timer); }
+  }
+
+  private async validate(task: Task, signal: AbortSignal, persist: () => Promise<void>): Promise<boolean> {
+    await this.idle(task);
+    task.checks = [];
+    const before = await snapshot(task);
+    assertScope(task, before.files);
     if (!before.files.length) throw new Error('执行者没有产生可审查的代码修改。');
+    let pwsh: string | undefined;
+    for (const directory of (process.env.PATH ?? '').split(path.delimiter)) {
+      const candidate = path.join(directory.replace(/^"|"$/g, ''), process.platform === 'win32' ? 'pwsh.exe' : 'pwsh');
+      try { await access(candidate); pwsh = candidate; break; } catch { /* 继续查找 PATH。 */ }
+    }
+    if (!pwsh) throw new Error('验收需要 PowerShell 7（pwsh），请安装并加入 PATH，不会回退到 PowerShell 5.1。');
     for (const command of task.handoff.validationCommands) {
       if (/\bgit\s+(push|reset|clean|restore|checkout|switch|commit|add|rebase|merge)\b/i.test(command)) throw new Error('验收命令包含 Git 修改或远程操作，已停止。');
       const script = `$ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue'; [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false); $OutputEncoding = [Console]::OutputEncoding; $global:LASTEXITCODE = 0;\n${command}\nif ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }`;
-      const result = await runProcess('pwsh', ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')], {
-        cwd: task.worktree, env: cleanEnvironment(), signal, timeoutMs: this.store.settings.timeoutMinutes * 60_000,
+      const result = await runProcess(pwsh, ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')], {
+        cwd: task.worktree, env: cleanEnvironment(), signal, timeoutMs: Math.max(1, task.deadline - Date.now()),
       });
       task.checks.push({ command, exitCode: result.code, output: redact(result.output).slice(-16000), at: new Date().toISOString() });
-      this.log(task, 'validation', `${command}\nexit=${result.code}\n${result.output}`); await this.changed(task);
+      await persist();
     }
-    const after = await snapshot(task); assertScope(task, after.files);
-    if(task.executor==='desktop')await nativeIdle(task);
+    const after = await snapshot(task);
+    assertScope(task, after.files);
+    if (!after.files.length) throw new Error('验收后没有可审查的代码修改。');
+    await this.idle(task);
     task.changedFiles = after.files; task.fingerprint = after.fingerprint;
     task.diffPath = path.join(this.store.taskDir(task.id), 'changes.diff');
-    await writeFile(task.diffPath, after.diff, 'utf8');
-    await writeFile(path.join(this.store.taskDir(task.id), 'validation.json'), JSON.stringify(task.checks, null, 2));
-    return task.checks.every(c => c.exitCode === 0);
+    await writeFile(task.diffPath, redact(after.diff), 'utf8');
+    return task.checks.every(check => check.exitCode === 0);
   }
-  private async requestPermission(task: Task, request: RequestPermissionRequest): Promise<RequestPermissionResponse> {
-    if (this.active?.controller.signal.aborted) return { outcome: { outcome: 'cancelled' } };
-    const id = randomUUID();
-    task.permission = { id, title: request.toolCall.title ?? 'DSH 请求额外权限', detail: redact(JSON.stringify(request.toolCall, null, 2)),
-      options: request.options.filter(o => o.kind !== 'allow_always').map(o => ({ id: o.optionId, name: o.name, kind: o.kind })) };
-    const answer = new Promise<RequestPermissionResponse>(resolve => this.permissionAnswers.set(id, resolve));
-    task.status = 'awaiting_permission'; await this.changed(task);
-    return answer;
-  }
-  async answerPermission(taskId: string, permissionId: string, optionId: string | null): Promise<void> {
-    const task = this.task(taskId); const permission = task.permission;
-    if (!permission || permission.id !== permissionId) throw new Error('权限请求已失效。');
-    if (optionId && !permission.options.some(o => o.id === optionId)) throw new Error('无效权限选项。');
-    const resolve = this.permissionAnswers.get(permissionId); if (!resolve) throw new Error('原执行进程已退出。');
-    this.permissionAnswers.delete(permissionId); delete task.permission;
-    task.status = 'running'; await this.changed(task);
-    resolve({ outcome: optionId ? { outcome: 'selected', optionId } : { outcome: 'cancelled' } });
-  }
-  private cancelPermissions(task: Task): void {
-    if (task.permission) { this.permissionAnswers.get(task.permission.id)?.({ outcome: { outcome: 'cancelled' } }); this.permissionAnswers.delete(task.permission.id); delete task.permission; }
-  }
-  async cancel(id: string): Promise<Task> {
-    const task = this.task(id);
-    if (task.status === 'committing') throw new Error('Git 提交正在完成，请等待，不能在提交中途取消。');
-    if (task.status === 'completed') return task;
-    this.cancelPermissions(task);
-    if (this.active?.id === id) this.active.controller.abort('user');
-    else { task.status = 'cancelled'; delete task.error; await this.changed(task); }
-    return task;
-  }
-  private async revise(task: Task): Promise<Task> {
-    if (task.status !== 'needs_changes' || !task.review || task.review.verdict !== 'changes_requested') throw new Error('当前任务没有可执行的审查修改意见。');
-    if (task.round >= 2) throw new Error('已达到两轮自动返工上限，请人工处理或提交新的明确方案。');
-    task.round++; this.instructions.set(task.id, '按以下审查意见修复，保持原方案与目录边界，不提交或暂存：\n' + JSON.stringify(task.review));
-    task.status = 'queued'; delete task.reviewedFingerprint; await this.changed(task); void this.pump(); return task;
-  }
-  private async resume(task: Task, instruction: string): Promise<Task> {
-    if (!['needs_attention', 'cancelled', 'failed', 'needs_changes'].includes(task.status)) throw new Error('只有中断或待处理任务可以明确恢复。');
-    if (task.worktree) await snapshot(task);
-    // 提示在发送时统一追加固定上下文（见 withTrellis），恢复分支不再单独拼接 Trellis 内容。
-    this.instructions.set(task.id, this.initialPrompt(task) + '\n明确的恢复指令：\n' + instruction);
-    task.status = 'queued'; delete task.review; delete task.reviewedFingerprint;
-    await this.changed(task); void this.pump(); return task;
-  }
-  async revalidate(id: string): Promise<Task> {
-    const task = this.task(id);
-    if (this.isActive() || !task.worktree || !revalidatableStatuses.has(task.status)) throw new Error('当前无法重新验证，请等待执行结束。');
-    const controller = new AbortController(); this.active = { id, controller };
-    const timer = setTimeout(() => controller.abort('timeout'), this.store.settings.timeoutMinutes * 60_000);
-    try {
-      if (task.executor === 'desktop') task.nativeCursor = (await nativeIdle(task, false)).cursor;
-      task.status = await this.validate(task, controller.signal) ? 'awaiting_review' : 'needs_changes';
-      delete task.review; delete task.reviewedFingerprint;
-    }
-    catch (error) { task.status = 'needs_attention'; task.error = safeError(error); }
-    finally { clearTimeout(timer); this.active = undefined; await this.changed(task); void this.pump(); }
-    return task;
-  }
-  async acceptReview(task: Task, fingerprint: string, review: Review, source: 'api' | 'codex'): Promise<Task> {
-    if (task.status !== 'awaiting_review') throw new Error('任务不在等待审查状态。');
-    validateReview(review);
-    // Reserve synchronously: concurrent approvals must not race through snapshot and commit.
-    task.status = 'committing';
-    let current;
-    try {
-    if(task.executor==='desktop')await nativeIdle(task);
-    current = await snapshot(task);
-    if (fingerprint !== task.fingerprint || current.fingerprint !== fingerprint) throw new Error('审查版本与当前代码不一致，请重新验证并审查。');
-    if (!task.checks.length || task.checks.some(c => c.exitCode !== 0)) throw new Error('验证尚未全部通过，不能完成审查。');
-    // 审批同时绑定代码与固定上下文：提交前核验固定副本仍与审查时一致。
-    if (task.handoff.trellis || task.trellis) await this.verifyPin(task);
-    } catch (error) { task.status = 'awaiting_review'; await this.changed(task); throw error; }
-    task.review = review; task.reviewSource = source;
-    if (review.verdict === 'changes_requested') { task.status = 'needs_changes'; await this.changed(task); return task; }
-    task.reviewedFingerprint = fingerprint; task.status = 'committing'; await this.changed(task);
-    let token: string | undefined;
-    try {
-      if (task.executor === 'desktop') token = (await nativeRequest('lock', { taskId: task.id, cursor: task.nativeCursor }) as { token: string }).token;
-      await finishCommit(task); task.status = 'completed'; delete task.error;
-    }
-    catch (error) { task.status = 'needs_attention'; task.error = safeError(error); }
-    finally {
-      if (token) await nativeRequest('unlock', { taskId: task.id, token }).catch(() => this.log(task, 'error', 'DSH 提交保护未确认释放，将在五分钟内自动过期。'));
-    }
-    await this.changed(task); return task;
-  }
-  result(id: string): Record<string, unknown> {
-    const task = this.task(id);
-    const nextAction = (task.status === 'queued' || busyStatuses.has(task.status) && task.status !== 'awaiting_permission')
-      ? { type: 'wait', tool: 'wait_task', arguments: { taskId: task.id, timeoutMs: 600000 } }
-      : { type: task.status === 'awaiting_review' ? 'review' : task.status === 'completed' ? 'done' : 'attention' };
-    return { taskId: task.id, status: task.status, updatedAt: task.updatedAt, nextAction,
-      title: task.handoff.title, worktree: task.worktree, branch: task.branch,
-      executor: task.executor ?? 'acp', nativeCursor:task.nativeCursor,
-      nativeGuidance:task.nativeGuidance,
-      nativeModel:task.nativeModel,
-      baseCommit: task.handoff.baseCommit, sessionId: task.sessionId, round: task.round, summary: task.summary,
-      checks: task.checks, changedFiles: task.changedFiles, fingerprint: task.fingerprint, diffPath: task.diffPath,
-      handoff: task.handoff, review: task.review, reviewSource: task.reviewSource, apiUsage: task.apiUsage,
-      trellis: task.trellis ? { taskPath: task.trellis.taskPath, baseCommit: task.trellis.baseCommit, sha256: task.trellis.sha256,
-        snapshotPath: task.trellis.snapshotPath, files: task.trellis.files, includedInFingerprint: true } : undefined,
-      commit: task.commit, commitMessage: task.handoff.commitMessage, gitStatus: task.commitStatus,
-      localOnly: true, error: task.error, permission: task.permission ? { title: task.permission.title, action: '在桌面软件中处理' } : undefined };
-  }
-  async wait(id: string, timeoutMs: number, reportProgress = false): Promise<Record<string, unknown>> {
+
+  async wait(id: string, timeoutMs = 600_000): Promise<Record<string, unknown>> {
     const started = Date.now();
-    const waiting = () => waitingStatuses.has(this.task(id).status);
-    const progress = () => { const task = this.task(id); return task.status + ':' + task.checks.length; };
-    const initialProgress = progress();
-    let reason: 'ready' | 'progress' | 'timeout' = 'ready';
-    if (waiting()) {
-      reason = 'timeout';
-      await new Promise<void>(resolve => {
-        const finish = () => { clearTimeout(timer); this.removeListener('change', listener); resolve(); };
-        const listener = () => {
-          if (!waiting()) { reason = 'ready'; finish(); }
-          else if (reportProgress && progress() !== initialProgress) { reason = 'progress'; finish(); }
-        };
-        const timer = setTimeout(finish, Math.min(Math.max(timeoutMs, 0), 600_000));
-        this.on('change', listener); listener();
-      });
+    if (!Number.isInteger(timeoutMs) || timeoutMs < 0 || timeoutMs > 600_000) throw new Error('timeoutMs 必须在 0..600000 之间。');
+    let task = await this.task(id);
+    if (timeoutMs > 0) {
+      await this.start(id);
+      task = await this.task(id);
+      while (running(task) && Date.now() - started < timeoutMs) {
+        await delay(Math.min(250, Math.max(1, timeoutMs - (Date.now() - started))));
+        task = await this.task(id);
+      }
+      if (!running(task)) await this.drivers.get(id)?.done;
+      task = await this.task(id);
     }
-    return { ...this.result(id), wait: { reason, elapsedMs: Date.now() - started } };
+    return { ...this.result(task), wait: { reason: running(task) ? 'timeout' : 'ready', elapsedMs: Date.now() - started } };
   }
-  async shutdown(): Promise<void> {
-    this.stopping = true;
-    for (const task of this.store.tasks) if (task.status === 'queued' || this.active?.id === task.id && task.status !== 'committing') await this.cancel(task.id);
-    while (this.isActive()) await new Promise<void>(resolve => setTimeout(resolve, 100));
-    clearTimeout(this.persistenceTimer); await this.store.save();
+
+  async cancel(id: string): Promise<Task> {
+    let task = await this.task(id);
+    if (task.status === 'completed' || task.status === 'cancelled') return task;
+    // 审查和提交持有同一把任务锁，不能在提交中途改写终态。
+    const release = await this.store.lock(id);
+    task = await this.task(id);
+    if (!release && !running(task)) throw new Error('任务正在审查或提交，请稍后重试。');
+    try {
+      if (task.status === 'completed' || task.status === 'cancelled') return task;
+      this.drivers.get(id)?.controller.abort('cancelled');
+      try { await this.client.cancel(id); }
+      catch (error) { task.error = safeError(error); }
+      task.status = 'cancelled';
+      await this.store.save(task);
+      return task;
+    } finally { await release?.(); }
+  }
+
+  result(task: Task): Record<string, unknown> {
+    let nextAction: Record<string, unknown> = { type: 'attention' };
+    if (running(task)) nextAction = { type: 'wait', tool: 'wait_task', arguments: { taskId: task.id, timeoutMs: 600000 } };
+    else if (task.status === 'awaiting_review') nextAction = { type: 'review' };
+    else if (task.status === 'completed') nextAction = { type: 'done' };
+    return {
+      taskId: task.id, status: task.status, nextAction, title: task.handoff.title,
+      worktree: task.worktree, branch: task.branch, baseCommit: task.handoff.baseCommit,
+      round: task.round, summary: task.summary, guidance: task.guidance, checks: task.checks,
+      changedFiles: task.changedFiles, fingerprint: task.fingerprint, diffPath: task.diffPath,
+      review: task.review, commit: task.commit, error: task.error, model: task.model,
+    };
   }
 }

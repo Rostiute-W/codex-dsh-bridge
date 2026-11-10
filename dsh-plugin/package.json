@@ -1,11 +1,11 @@
 {
-  "name": "@codex-dsh/desktop-observer",
-  "version": "0.2.1",
-  "description": "在 DeepSeek Harness 原生对话中执行 Codex 交接任务",
+  "name": "@codex-dsh/bridge",
+  "version": "0.3.0",
+  "description": "Codex 交接任务的 DSH 原生对话连接",
   "type": "module",
   "main": "index.js",
   "exports": { ".": "./index.js", "./client": "./client.js", "./package.json": "./package.json", "./cordis.patch.yml": "./cordis.patch.yml" },
-  "files": ["index.js", "native.js", "client.js", "bridge-config.json", "cordis.patch.yml"],
+  "files": ["index.js", "client.js", "bridge-config.json", "cordis.patch.yml"],
   "dsh": {
     "bundle": { "patch": "./cordis.patch.yml" },
     "client": { "platform": "web", "inject": ["@deepseek-ai/dsh-client-ui-workspace"] }
