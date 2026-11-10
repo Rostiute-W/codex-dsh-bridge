@@ -46,6 +46,16 @@ node dist/install.js --dsh 'E:\DeepSeek Harness\resources\runtime\cli\bin\dsh.cm
 
 数据保存在 `%LOCALAPPDATA%\CodexDshBridge\tasks\<id>`：`state.json`、`workspace`、`changes.diff`、运行中的 PID 锁。中断后通过 wait_task 接管仍在运行或验收的任务；异常、超时和取消均保留文件。旧版任务和设置不读取、不迁移、不删除。
 
+### 最小试跑
+
+想先看一遍闭环，可以让 Codex 派发一个只改文档的小任务：
+
+1. 在一个干净的 Git 仓库中，让 Codex 通过 `$codex-dsh-bridge` 派发一个仅修改 `README.md` 的小任务，并附上 PowerShell 验收命令。
+2. 打开 DSH 原生对话观察执行过程；需要时在那里引导方向、切换模型或处理权限。
+3. 回到 Codex，用 `wait_task` 等待验收结果，并审查 `changes.diff` 中的真实改动；批准后由 Bridge 创建本地提交。
+
+试跑任务在独立分支和 worktree 中进行，不推送，也不自动合并原项目。
+
 ## 开发检查
 
 ```powershell
