@@ -34,6 +34,8 @@ export interface Task {
   id: string; handoff: Handoff; status: Status; deadline: number;
   worktree?: string; branch?: string; sessionId?: string; beforeSeq: number; cursor?: number;
   round: number; summary: string; guidance: { seq: number; text: string }[];
+  blocked?: { kind: 'approval' | 'question'; seq: number; text: string; since: string };
+  stalledSince?: string;
   checks: { command: string; exitCode: number; output: string; at: string }[];
   changedFiles: string[]; fingerprint?: string; diffPath?: string;
   review?: Review; reviewedFingerprint?: string; commit?: string; error?: string; model?: string;
@@ -49,11 +51,16 @@ const running = (task: Task) => task.status === 'running' || task.status === 'va
 
 export class Engine {
   private readonly drivers = new Map<string, { controller: AbortController; done: Promise<void> }>();
+  private readonly reported = new Map<string, string>();
   private readonly timeoutMs: number;
+  private readonly stallMs: number;
   constructor(readonly store = new Store(), private readonly client: DshClient = dsh) {
     const minutes = Number(process.env.BRIDGE_TIMEOUT_MINUTES ?? 300);
     if (!Number.isFinite(minutes) || minutes <= 0) throw new Error('BRIDGE_TIMEOUT_MINUTES 必须为正数。');
     this.timeoutMs = minutes * 60_000;
+    const stallMinutes = Number(process.env.BRIDGE_STALL_MINUTES ?? 10);
+    if (!Number.isFinite(stallMinutes) || stallMinutes <= 0) throw new Error('BRIDGE_STALL_MINUTES 必须为正数。');
+    this.stallMs = stallMinutes * 60_000;
   }
 
   async task(id: string): Promise<Task> {
@@ -174,6 +181,7 @@ export class Engine {
     // 先持久化运行状态，响应丢失时接管者只观察原会话，不自动重发提示词。
     task.status = 'running';
     delete task.error; delete task.fingerprint; delete task.reviewedFingerprint;
+    delete task.blocked; delete task.stalledSince;
     task.checks = [];
     await persist();
     const requestId = task.id + '-' + createHash('sha256').update(`${task.round}\n${prompt}`).digest('hex');
@@ -185,6 +193,17 @@ export class Engine {
   private observe(task: Task, state: NativeState): void {
     task.summary = redact(state.summary);
     task.guidance = state.guidance.map(item => ({ seq: item.seq, text: redact(item.text) }));
+    if (state.blocked) {
+      const same = task.blocked?.kind === state.blocked.kind && task.blocked?.seq === state.blocked.seq;
+      task.blocked = {
+        kind: state.blocked.kind,
+        seq: state.blocked.seq,
+        text: redact(state.blocked.text),
+        since: same ? task.blocked!.since : new Date().toISOString(),
+      };
+    } else {
+      delete task.blocked;
+    }
   }
 
   private async idle(task: Task): Promise<NativeState> {
@@ -209,6 +228,7 @@ export class Engine {
         task.beforeSeq = task.cursor ?? -1;
         task.cursor = state.cursor;
         task.status = state.status === 'idle' && !state.pending ? 'validating' : 'running';
+        if (task.status === 'validating') { delete task.blocked; delete task.stalledSince; }
         delete task.fingerprint; delete task.review; delete task.reviewedFingerprint;
         await this.store.save(task);
       }
@@ -235,17 +255,34 @@ export class Engine {
     };
     try {
       if (remaining <= 0) throw new Error('任务超过总运行时限，现场已保留。');
+      let lastCursor: number | undefined;
+      let lastCursorAt = Date.now();
       while (running(task)) {
         if ((await this.task(task.id)).status === 'cancelled') return;
         if (controller.signal.aborted) throw new Error('执行已取消或超时。');
         if (task.status === 'running') {
+          const prevBlocked = task.blocked ? `${task.blocked.kind}:${task.blocked.seq}` : undefined;
+          const prevStalled = task.stalledSince;
           const state = await this.client.inspect(task.id);
           this.observe(task, state);
           if (state.status !== 'idle' || state.pending || state.endSeq <= task.beforeSeq) {
+            if (state.cursor !== lastCursor) {
+              lastCursor = state.cursor;
+              lastCursorAt = Date.now();
+              delete task.stalledSince;
+            } else if (task.blocked) {
+              lastCursorAt = Date.now();
+              delete task.stalledSince;
+            } else if (Date.now() - lastCursorAt >= this.stallMs) {
+              task.stalledSince ??= new Date(lastCursorAt).toISOString();
+            }
+            const nextBlocked = task.blocked ? `${task.blocked.kind}:${task.blocked.seq}` : undefined;
+            if (nextBlocked !== prevBlocked || task.stalledSince !== prevStalled) await persist();
             await delay(1500, undefined, { signal: controller.signal }); continue;
           }
           if (state.reason !== 'completed') throw new Error(`DSH 未正常完成（${state.reason ?? 'unknown'}），现场已保留。`);
           task.cursor = state.cursor; task.status = 'validating';
+          delete task.blocked; delete task.stalledSince;
           await persist();
         }
         const passed = await this.validate(task, controller.signal, persist);
@@ -258,6 +295,7 @@ export class Engine {
           task.round++;
           await persist();
           await this.send(task, '修复以下真实验收失败，保持原方案与 allowedPaths，不暂存、不提交：\n' + JSON.stringify(task.checks.filter(check => check.exitCode !== 0)), persist);
+          lastCursor = undefined; lastCursorAt = Date.now();
           continue;
         }
         await persist();
@@ -305,17 +343,28 @@ export class Engine {
     const started = Date.now();
     if (!Number.isInteger(timeoutMs) || timeoutMs < 0 || timeoutMs > 600_000) throw new Error('timeoutMs 必须在 0..600000 之间。');
     let task = await this.task(id);
+    let reason: 'timeout' | 'blocked' | 'stalled' = 'timeout';
+    const key = (t: Task) => t.blocked ? `b:${t.blocked.kind}:${t.blocked.seq}` : t.stalledSince ? `s:${t.stalledSince}` : undefined;
     if (timeoutMs > 0) {
       await this.start(id);
       task = await this.task(id);
-      while (running(task) && Date.now() - started < timeoutMs) {
+      while (running(task)) {
+        const current = key(task);
+        if (current && current !== this.reported.get(id)) {
+          this.reported.set(id, current);
+          reason = current.startsWith('b:') ? 'blocked' : 'stalled';
+          break;
+        }
+        if (Date.now() - started >= timeoutMs) break;
         await delay(Math.min(250, Math.max(1, timeoutMs - (Date.now() - started))));
         task = await this.task(id);
       }
-      if (!running(task)) await this.drivers.get(id)?.done;
-      task = await this.task(id);
+      if (!running(task)) {
+        await this.drivers.get(id)?.done;
+        task = await this.task(id);
+      }
     }
-    return { ...this.result(task), wait: { reason: running(task) ? 'timeout' : 'ready', elapsedMs: Date.now() - started } };
+    return { ...this.result(task), wait: { reason: running(task) ? reason : 'ready', elapsedMs: Date.now() - started } };
   }
 
   async cancel(id: string): Promise<Task> {
@@ -338,14 +387,25 @@ export class Engine {
 
   result(task: Task): Record<string, unknown> {
     let nextAction: Record<string, unknown> = { type: 'attention' };
-    if (running(task)) nextAction = { type: 'wait', tool: 'wait_task', arguments: { taskId: task.id, timeoutMs: 600000 } };
+    if (running(task)) {
+      const notice = task.blocked
+        ? `请在 DSH 对话中处理${task.blocked.kind === 'approval' ? '权限审批' : '提问'}：${task.blocked.text}`
+        : task.stalledSince
+          ? `DSH 自 ${task.stalledSince} 起没有新进展，请到 DSH 对话中查看`
+          : undefined;
+      nextAction = {
+        type: 'wait', tool: 'wait_task', arguments: { taskId: task.id, timeoutMs: 600000 },
+        ...(notice ? { notice } : {}),
+      };
+    }
     else if (task.status === 'awaiting_review') nextAction = { type: 'review' };
     else if (task.status === 'completed') nextAction = { type: 'done' };
     return {
       taskId: task.id, status: task.status, nextAction, title: task.handoff.title,
       worktree: task.worktree, branch: task.branch, baseCommit: task.handoff.baseCommit,
-      round: task.round, summary: task.summary, guidance: task.guidance, checks: task.checks,
-      changedFiles: task.changedFiles, fingerprint: task.fingerprint, diffPath: task.diffPath,
+      round: task.round, summary: task.summary, guidance: task.guidance,
+      blocked: task.blocked, stalledSince: task.stalledSince,
+      checks: task.checks, changedFiles: task.changedFiles, fingerprint: task.fingerprint, diffPath: task.diffPath,
       review: task.review, commit: task.commit, error: task.error, model: task.model,
     };
   }

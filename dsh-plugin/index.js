@@ -53,18 +53,40 @@ export function nativeFailureMessage(method,error) {
 export function nativeController(ctx, dataRoot) {
   let focus={seq:0};
   const sessionId=taskId=>'session-codex-'+taskId;
+  const questionText=raw=>{
+    try {
+      const parsed=typeof raw==='string'?JSON.parse(raw):raw;
+      const parts=Array.isArray(parsed?.questions)
+        ?parsed.questions.map(q=>[q?.header,q?.question].filter(v=>typeof v==='string'&&v.trim()).join(': ')).filter(Boolean)
+        :[];
+      if(parts.length)return parts.join('；');
+    } catch {}
+    return '等待用户回答问题';
+  };
   const state=async taskId=>{
     const id=sessionId(taskId),agent=ctx.agents.get(id);
     if(!agent)throw new Error('DSH 原生会话未附着，请明确恢复任务。');
     const observation=await ctx.sessionQuery.observeSession(id);
     try {
       const events=observation.events;
-      const end=events.findLast(event=>event.type==='turn/end');
-      const message=events.findLast(event=>event.type==='assistant/message');
+      let end,message;
+      const guidance=[],unresolved=new Map();
+      for(const event of events) {
+        if(event.type==='turn/end')end=event;
+        else if(event.type==='assistant/message')message=event;
+        else if(event.type==='user/message'&&event.data.source?.kind==='user'&&!event.data.source.rpcId?.startsWith(taskId+'-'))guidance.push(event);
+        else if(event.type==='approval/asked'&&event.data?.id)unresolved.set('a:'+event.data.id,{kind:'approval',seq:event.seq,text:([event.data.toolName,event.data.reason].filter(v=>typeof v==='string'&&v.trim()).join(': ')||'等待权限审批').slice(0,2000)});
+        else if(event.type==='approval/decided'&&event.data?.id)unresolved.delete('a:'+event.data.id);
+        else if(event.type==='tool/call'&&event.data?.name==='ask_user_question'&&event.data?.callId)unresolved.set('q:'+event.data.callId,{kind:'question',seq:event.seq,text:questionText(event.data.arguments).slice(0,2000)});
+        else if(event.type==='tool/result'&&event.data?.message?.toolCallId)unresolved.delete('q:'+event.data.message.toolCallId);
+      }
+      let blocked;
+      for(const item of unresolved.values())if(!blocked||item.seq>blocked.seq)blocked=item;
       return {sessionId:id,status:agent.status,pending:agent.inbox.nextTurn.length+agent.inbox.nextStep.length,
         cursor:events.at(-1)?.seq ?? -1,endSeq:end?.seq ?? -1,reason:end?.data.reason?.kind ?? end?.data.reason,
-        guidance:events.filter(event=>event.type==='user/message'&&event.data.source?.kind==='user'&&!event.data.source.rpcId?.startsWith(taskId+'-')).slice(-20).map(event=>({seq:event.seq,text:(event.data.content??[]).filter(part=>part.type==='text').map(part=>part.text).join('').slice(-8000)})),
-        summary:(message?.data.message?.content ?? message?.data.content ?? []).filter(part=>part.type==='text').map(part=>part.text).join('').slice(-128000)};
+        guidance:guidance.slice(-20).map(event=>({seq:event.seq,text:(event.data.content??[]).filter(part=>part.type==='text').map(part=>part.text).join('').slice(-8000)})),
+        summary:(message?.data.message?.content ?? message?.data.content ?? []).filter(part=>part.type==='text').map(part=>part.text).join('').slice(-128000),
+        ...(blocked?{blocked}:{})};
     } finally {observation[Symbol.dispose]();}
   };
   return {focus:()=>focus,async call(method,params) {

@@ -144,7 +144,7 @@ DSH 会话里可以直接补充方向、切换模型和处理权限。`guidance`
 ### 等待
 
 - `wait_task` 使用同一个 `taskId` 持续等待，单次 `timeoutMs` 范围是 0 到 600000，默认 600000。
-- `timeout` 不是完成。继续用同一 `taskId` 调用 `wait_task`，直到 `nextAction` 为 `review` 或 `attention`。
+- `timeout` 不是完成。继续用同一 `taskId` 调用 `wait_task`，直到 `nextAction` 为 `review` 或 `attention`；遇到 `blocked` 或 `stalled` 时先按 `nextAction.notice` 在 DSH 中处理后再继续等待。
 - 只想读取已知任务的当前结果时，使用 `wait_task` 并设置 `timeoutMs: 0`。
 - 工具调用中断时保留 `taskId`；恢复连接后继续等待原任务，不要重复提交新的 `execute`。
 - 用户继续 DSH 对话后，下一次 `wait_task` 会自动重新验收并生成新指纹，旧审查随即失效。
@@ -174,6 +174,7 @@ DSH 会话里可以直接补充方向、切换模型和处理权限。`guidance`
 | `DSH_HOME` | DSH 数据目录，默认 `~/.dsh` | 自定义时，运行安装器时设置会写入 MCP 环境；安装、DSH 运行和 MCP 运行必须使用同一个值 |
 | `DSH_MODEL` | 新任务的默认模型，可为空 | 建议配置到 MCP 环境；`handoff.model` 会覆盖它，空值跟随 DSH 默认 |
 | `BRIDGE_TIMEOUT_MINUTES` | 单任务总运行时限，默认 300 分钟 | 建议配置到 MCP 环境；必须为正数 |
+| `BRIDGE_STALL_MINUTES` | DSH 无新事件且未阻塞时判定停滞的阈值，默认 10 分钟 | 建议配置到 MCP 环境；必须为正数 |
 
 查看 DSH 中的模型、推理强度和默认项：
 

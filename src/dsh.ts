@@ -18,6 +18,7 @@ export interface ModelCatalog {
 export interface NativeState {
   sessionId: string; status: string; pending: number; cursor: number; endSeq: number;
   reason?: string; summary: string; guidance: { seq: number; text: string }[];
+  blocked?: { kind: 'approval' | 'question'; seq: number; text: string };
 }
 export interface Send {
   taskId: string; cwd: string; title: string; prompt: string; requestId: string; model?: Model;

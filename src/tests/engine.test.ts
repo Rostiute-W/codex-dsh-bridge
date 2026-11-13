@@ -8,7 +8,12 @@ import { Store } from '../store.js';
 import { git } from '../git.js';
 import type { DshClient, Send, NativeState } from '../dsh.js';
 
-async function fixture(t: TestContext, modify: (params: Send, round: number) => Promise<void>, command = "if (-not (Test-Path 'value.txt')) { exit 1 }") {
+async function fixture(
+  t: TestContext,
+  modify: (params: Send, round: number) => Promise<void>,
+  command = "if (-not (Test-Path 'value.txt')) { exit 1 }",
+  onInspect?: (taskId: string, base: NativeState) => Promise<NativeState> | NativeState,
+) {
   const temporary = await mkdtemp(path.join(os.tmpdir(), 'codex-dsh-engine-'));
   t.after(() => rm(temporary, { recursive: true, force: true }));
   const repo = path.join(temporary, 'repo');
@@ -32,7 +37,8 @@ async function fixture(t: TestContext, modify: (params: Send, round: number) => 
       return { sessionId: `session-codex-${params.taskId}`, beforeSeq };
     },
     async inspect(taskId): Promise<NativeState> {
-      return { sessionId: `session-codex-${taskId}`, status: 'idle', pending: 0, cursor, endSeq: cursor, reason: 'completed', summary: '假 DSH 已完成修改。', guidance: [] };
+      const base: NativeState = { sessionId: `session-codex-${taskId}`, status: 'idle', pending: 0, cursor, endSeq: cursor, reason: 'completed', summary: '假 DSH 已完成修改。', guidance: [] };
+      return onInspect ? await onInspect(taskId, base) : base;
     },
     async cancel() { return { ok: true }; },
   };
@@ -100,4 +106,61 @@ test('同 requestId 同内容幂等，不同内容报错', async t => {
   assert.equal((await engine.wait(task.id, 60_000)).status, 'awaiting_review');
   await assert.rejects(engine.submit({ operation: 'execute', handoff: { ...handoff, title: '不同内容' } }), /requestId 已用于不同/);
   assert.equal(sent.length, 1);
+});
+
+test('blocked 时立即以 reason blocked 返回，完成后再 wait 到 awaiting_review', async t => {
+  let stage: 'blocked' | 'done' = 'blocked';
+  let worktree = '';
+  const { engine, handoff } = await fixture(
+    t,
+    async params => { worktree = params.cwd; },
+    undefined,
+    (_taskId, base) => {
+      if (stage === 'blocked') {
+        return {
+          ...base,
+          status: 'running',
+          cursor: 1,
+          endSeq: 0,
+          blocked: { kind: 'approval', seq: 1, text: 'pwsh: escalate sandbox' },
+        };
+      }
+      return { ...base, cursor: 3, endSeq: 3 };
+    },
+  );
+  const task = await engine.submit({ operation: 'execute', handoff });
+  const blockedResult = await engine.wait(task.id, 60_000);
+  assert.equal(blockedResult.status, 'running');
+  assert.equal((blockedResult.wait as { reason: string }).reason, 'blocked');
+  assert.equal((blockedResult.blocked as { kind: string; seq: number }).kind, 'approval');
+  assert.match(String((blockedResult.nextAction as { notice?: string }).notice), /权限审批.*pwsh: escalate sandbox/);
+
+  await writeFile(path.join(worktree, 'value.txt'), 'done\n');
+  stage = 'done';
+  const readyResult = await engine.wait(task.id, 60_000);
+  assert.equal(readyResult.status, 'awaiting_review');
+  assert.equal((readyResult.wait as { reason: string }).reason, 'ready');
+  assert.equal(readyResult.blocked, undefined);
+});
+
+test('cursor 长时间不变且无 blocked 时以 reason stalled 返回', async t => {
+  const previous = process.env.BRIDGE_STALL_MINUTES;
+  process.env.BRIDGE_STALL_MINUTES = '0.002';
+  t.after(() => {
+    if (previous === undefined) delete process.env.BRIDGE_STALL_MINUTES;
+    else process.env.BRIDGE_STALL_MINUTES = previous;
+  });
+  const { engine, handoff } = await fixture(
+    t,
+    async () => {},
+    undefined,
+    (_taskId, base) => ({ ...base, status: 'running', cursor: 1, endSeq: 0 }),
+  );
+  const task = await engine.submit({ operation: 'execute', handoff });
+  const stalledResult = await engine.wait(task.id, 60_000);
+  assert.equal(stalledResult.status, 'running');
+  assert.equal((stalledResult.wait as { reason: string }).reason, 'stalled');
+  assert.equal(typeof stalledResult.stalledSince, 'string');
+  assert.match(String((stalledResult.nextAction as { notice?: string }).notice), /没有新进展/);
+  await engine.cancel(task.id);
 });

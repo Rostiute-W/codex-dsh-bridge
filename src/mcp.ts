@@ -20,7 +20,7 @@ server.registerTool('submit_task', {
   }, annotations: { destructiveHint: false, idempotentHint: false, openWorldHint: true },
 }, args => call(async () => engine.result(await engine.submit(args))));
 server.registerTool('wait_task', {
-  description: '等待任务离开 running/validating；timeout 必须继续等待，0 只读取当前结果。用户继续 DSH 对话后，等待会自动更新验收与审查指纹。',
+  description: '等待任务离开 running/validating；timeout 必须继续等待，0 只读取当前结果。reason 为 blocked/stalled 时把 nextAction.notice 告诉用户，然后继续 wait_task。用户继续 DSH 对话后，等待会自动更新验收与审查指纹。',
   inputSchema: { taskId: z.string().uuid(), timeoutMs: z.number().int().min(0).max(600000).default(600000) },
 }, args => call(() => engine.wait(args.taskId, args.timeoutMs)));
 server.registerTool('cancel_task', {
