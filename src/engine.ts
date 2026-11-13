@@ -168,7 +168,7 @@ export class Engine {
 
   private initialPrompt(task: Task): string {
     return [
-      '你是 Codex 委派的执行者。完成交接方案，读取并遵循工作目录内适用的 AGENTS.md。只编写代码、运行检查和修复；Codex 审查，Bridge 最终提交。',
+      '你是规划端委派的执行者。完成交接方案，读取并遵循工作目录内适用的 AGENTS.md。只编写代码、运行检查和修复；规划端审查，Bridge 最终提交。',
       '不要 git add、git commit、切换分支、改写历史、push、部署或修改原始项目目录。当前目录是独立 worktree。不要启动子 agent；遇到方案矛盾或必须改变架构时停止并报告。',
       '凭据使用已有 DSH 配置，不能输出凭据。不要访问任务不需要的个人文件。保持变更在 allowedPaths 范围内。',
       JSON.stringify(task.handoff, null, 2), '结束前说明实际修改、验证结果和未解决问题。不要把未通过检查的任务称为完成。',

@@ -22,7 +22,7 @@ export async function prepareWorktree(task: Task, taskDir: string): Promise<void
   const dirty = await git(repo, ['status', '--porcelain']);
   if (dirty) throw new Error('项目存在未提交修改。请先保留或提交用户修改，再重新提交任务；软件不会自动暂存它们。');
   const head = await git(repo, ['rev-parse', 'HEAD']);
-  if (head !== task.handoff.baseCommit) throw new Error('代码基准与当前 HEAD 不一致，请让 Codex 重新核对方案。');
+  if (head !== task.handoff.baseCommit) throw new Error('代码基准与当前 HEAD 不一致，请重新核对方案。');
   task.handoff.allowedPaths.forEach(validateRelative);
   await mkdir(taskDir, { recursive: true });
   task.worktree = path.join(taskDir, 'workspace');
