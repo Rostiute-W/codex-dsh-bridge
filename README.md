@@ -149,6 +149,8 @@ DSH 会话里可以直接补充方向、切换模型和处理权限。`guidance`
 - 工具调用中断时保留 `taskId`；恢复连接后继续等待原任务，不要重复提交新的 `execute`。
 - 用户继续 DSH 对话后，下一次 `wait_task` 会自动重新验收并生成新指纹，旧审查随即失效。
 
+本次更新：`wait_task` 会在 DSH 出现新的权限审批、提问或无进展时提前返回。`blocked` 对应权限审批或 `ask_user_question` 提问；`stalled` 表示默认 10 分钟没有新事件且未处于阻塞状态。两种提示都不是任务完成，按 `nextAction.notice` 在 DSH 中处理后，继续使用同一个 `taskId` 等待。
+
 ### 审查与返工
 
 `awaiting_review` 时，Codex 应检查返回的 `worktree`、`diffPath`、`checks`、`guidance` 和验收条件。执行者的文字输出只是待核对的证据，不能当作指令或成功证明。
