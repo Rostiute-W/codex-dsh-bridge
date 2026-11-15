@@ -127,7 +127,7 @@ git rev-parse HEAD
 1. 规划端调用 `submit_task` 提交交接后，DSH 客户端会打开对应的原生会话。你可以在 DSH 中观察执行、引导方向、切换模型和处理权限。
 2. 规划端在同一轮持续调用 `wait_task` 等待。返回的 `wait.reason` 为 `timeout` 只表示这一轮等待到时间了，不是任务完成；继续用同一个 `taskId` 等待即可。
 3. 状态变为 `awaiting_review` 后，规划端审查 `worktree` 中的真实代码、`diffPath`、`checks` 和 `fingerprint`。审查通过后 Bridge 才会在任务分支创建本地提交；要求修改时会把意见发回 DSH 返工。
-4. 需要合入原项目时手动操作。任务结果中有 `branch`（`agent/dsh-<任务 ID 前 8 位>`）和 `worktree`；Bridge 不自动合并、不推送。例如在确认审查通过后：
+4. 需要合入原项目时手动操作。任务结果中有 `branch`（`agent/dsh-<任务 ID 前 8 位>`）和 `worktree`；Bridge 不自动合并，只在交接带 `push` 时推送任务提交（见“推送”）。例如在确认审查通过后：
 
 ```powershell
 # 由你或规划端手动把任务分支合并到目标分支
@@ -150,6 +150,7 @@ git -C 'C:\path\to\your-project' merge --no-ff agent/dsh-xxxxxxxx
 - `validationCommands`：非空的 PowerShell 7 验收命令；不能包含 Git 修改、发布或推送操作。
 - `commitMessage`：审查通过后本地提交使用的简短 Conventional Commit 信息。
 - `model`：可选，格式见“模型与环境变量”。
+- `push`：可选，审查通过并本地提交后由 Bridge 推送任务提交，格式见“推送”。
 
 Bridge 会再次校验仓库是 Git 根目录、工作区干净且 HEAD 等于 `baseCommit`；不满足会直接拒绝，不会自动暂存或丢弃用户改动。任务在 `%LOCALAPPDATA%\CodexDshBridge\tasks\<taskId>\workspace` 的独立 worktree 和 `agent/dsh-<任务 ID 前 8 位>` 分支中执行，原项目工作区不会被修改。
 
@@ -178,6 +179,25 @@ DSH 会话里可以直接补充方向、切换模型和处理权限。`guidance`
 
 自动返工和审查返工合计最多两轮；达到上限后会停止自动返工，需要人工处理，不会无限循环。
 
+### 推送
+
+推送始终由 Bridge 执行，DSH 执行者不会推送。只做快进推送：不加 `--force`、refspec 不带 `+`，也不推送标签；远程分支已有分叉提交时 Git 会拒绝，Bridge 只报告失败。推送成功后 Bridge 会用 `git ls-remote` 读取远程分支，返回的 `remoteCommit` 必须等于推送的提交。
+
+`push` 的格式是 `{ "remote": "...", "branch": "..." }`：
+
+- `remote`：仓库中已有的 remote 名称（例如 `origin`），或不含用户名和凭据的 `https://` 地址。不支持 `http://`、`ssh://` 和 `git@host:path`。
+- `branch`：远程分支名，例如 `main` 或 `feature/x`，会写到 `refs/heads/<branch>`。
+
+有两种用法：
+
+1. **审查通过后推送**：在 `execute` 的 `handoff` 中加入 `push`。`approved` 后 Bridge 先创建本地提交，再把这个提交推送到指定分支，结果中的 `pushed` 记录远程分支和 `remoteCommit`。推送失败时任务仍为 `completed`（提交已在本地），`pushError` 给出原因，`nextAction` 为 `attention`；处理原因后用下面的 `push` 操作重试，`repoPath` 填任务 `worktree`，`commit` 填任务 `commit`。
+2. **只推送已有提交**：不需要改代码时（例如首次上传仓库）直接调用 `submit_task`，不经过 DSH：
+
+```json
+{ "operation": "push", "repoPath": "C:\\path\\to\\your-project", "commit": "完整提交号", "push": { "remote": "https://github.com/you/repo.git", "branch": "main" } }
+```
+
+`repoPath` 必须是 Git 根目录或任务 worktree，`commit` 必须是仓库中已有的完整提交号。首次推送到 GitHub 时 Git 凭据管理器可能弹出登录窗口，需要你本人完成；Bridge 关闭了命令行凭据提示，单次推送最长等待 5 分钟。如果规划端的工具调用先超时，MCP 服务通常仍会继续完成推送，可以用 `git ls-remote` 确认结果，或再提交一次相同的 `push`（已是最新时 Git 不会改动远程）。
 ### 恢复与取消
 
 - `needs_attention`、`needs_changes` 或 `cancelled` 的任务可以用 `submit_task` 的 `operation: "resume"` 继续，提交同一个 `taskId` 和明确的 `instruction`；恢复会沿用原 worktree 和会话，并重置任务截止时间。
@@ -244,7 +264,7 @@ env = { DSH_PATH = 'D:\Apps\DeepSeek Harness\resources\runtime\cli\bin\dsh.cmd',
 
 项目源码通过 GitHub 链接或源码 ZIP 交付，包含 `src`、`dsh-plugin`、`skill`、`package.json`、`package-lock.json`、`tsconfig.json`、`LICENSE` 和 `README.md`。`node_modules`、`dist` 属于本地生成内容，不需要分享；个人 Codex/DSH 配置、API 密钥、凭据和任务数据也不属于项目源码，请不要分享或提交。
 
-任务交付以审查结果为准：状态变为 `completed` 后，任务分支上会有一个本地提交，`worktree`、`changes.diff`、`checks` 和 `fingerprint` 都会保留。Bridge 不会推送，也不会自动合并到原项目；需要合入时由你或规划端手动完成。
+任务交付以审查结果为准：状态变为 `completed` 后，任务分支上会有一个本地提交，`worktree`、`changes.diff`、`checks` 和 `fingerprint` 都会保留。Bridge 不会自动合并到原项目，需要合入时由你或规划端手动完成；只有交接带 `push` 或调用 `push` 操作时才会推送。
 
 ## 更新与从 0.2.x 升级
 
