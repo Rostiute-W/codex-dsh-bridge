@@ -5,9 +5,10 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { z } from 'zod';
 import { Store } from './store.js';
 import { dsh, parseModel, validateModel, type DshClient, type NativeState } from './dsh.js';
-import { prepareWorktree, snapshot, assertScope, finishCommit } from './git.js';
+import { prepareWorktree, snapshot, assertScope, finishCommit, gitRoot, pushCommit, validatePushTarget } from './git.js';
 import { cleanEnvironment, runProcess } from './process.js';
 
+export const pushSchema = z.object({ remote: z.string().min(1).max(2000), branch: z.string().min(1).max(200) }).strict();
 export const handoffSchema = z.object({
   requestId: z.string().min(8).max(160), title: z.string().min(1).max(160),
   repoPath: z.string().min(1).max(2000), baseCommit: z.string().regex(/^[a-f0-9]{40,64}$/i), ready: z.literal(true),
@@ -16,7 +17,7 @@ export const handoffSchema = z.object({
   allowedPaths: z.array(z.string().min(1).max(1000)).min(1).max(80),
   validationCommands: z.array(z.string().min(1).max(4000)).min(1).max(20),
   acceptanceCriteria: z.array(z.string().min(1).max(4000)).min(1).max(40),
-  commitMessage: z.string().min(8).max(180), model: z.string().max(800).optional(),
+  commitMessage: z.string().min(8).max(180), model: z.string().max(800).optional(), push: pushSchema.optional(),
 }).strict();
 export const reviewSchema = z.object({
   verdict: z.enum(['approved', 'changes_requested']), summary: z.string().min(1).max(16000),
@@ -27,6 +28,9 @@ const submitSchema = z.discriminatedUnion('operation', [
   z.object({ operation: z.literal('review'), taskId: z.string().uuid(), fingerprint: z.string().regex(/^[a-f0-9]{64}$/i), review: reviewSchema }).strict(),
   z.object({ operation: z.literal('resume'), taskId: z.string().uuid(), instruction: z.string().min(1).max(16000) }).strict(),
 ]);
+export const pushRequestSchema = z.object({
+  operation: z.literal('push'), repoPath: z.string().min(1).max(2000), commit: z.string().regex(/^[a-f0-9]{40,64}$/i), push: pushSchema,
+}).strict();
 export type Handoff = z.infer<typeof handoffSchema>;
 export type Review = z.infer<typeof reviewSchema>;
 export type Status = 'running' | 'validating' | 'awaiting_review' | 'needs_changes' | 'needs_attention' | 'completed' | 'cancelled';
@@ -39,6 +43,7 @@ export interface Task {
   checks: { command: string; exitCode: number; output: string; at: string }[];
   changedFiles: string[]; fingerprint?: string; diffPath?: string;
   review?: Review; reviewedFingerprint?: string; commit?: string; error?: string; model?: string;
+  pushed?: { remote: string; branch: string; commit: string; remoteCommit: string; output: string; at: string }; pushError?: string;
 }
 export function redact(text: string): string {
   return text.replace(/\b(?:sk|ds)[-_][a-zA-Z0-9_-]{16,}\b/g, '[已隐藏凭据]')
@@ -103,6 +108,13 @@ export class Engine {
             task.status = 'completed';
             delete task.error;
           } catch (error) { task.status = 'needs_attention'; task.error = safeError(error); }
+          if (task.status === 'completed' && task.handoff.push) {
+            try {
+              const pushed = await pushCommit(task.worktree!, task.commit!, task.handoff.push);
+              task.pushed = { ...task.handoff.push, commit: task.commit!, remoteCommit: pushed.remoteCommit, output: redact(pushed.output), at: new Date().toISOString() };
+              delete task.pushError;
+            } catch (error) { task.pushError = safeError(error); }
+          }
         }
       } else {
         if (!['needs_attention', 'needs_changes', 'cancelled'].includes(task.status)) throw new Error('只有待处理、待修改或已取消的任务可以恢复。');
@@ -132,6 +144,7 @@ export class Engine {
     const id = `${digest.slice(0, 8)}-${digest.slice(8, 12)}-4${digest.slice(13, 16)}-a${digest.slice(17, 20)}-${digest.slice(20, 32)}`;
     const existing = await this.store.load(id);
     if (existing) return this.duplicate(existing, handoff);
+    if (handoff.push) await validatePushTarget(await gitRoot(handoff.repoPath), handoff.push);
     const release = await this.store.lock(id);
     if (!release) {
       const concurrent = await this.store.load(id);
@@ -168,8 +181,8 @@ export class Engine {
 
   private initialPrompt(task: Task): string {
     return [
-      '你是 Codex 委派的执行者。完成交接方案，读取并遵循工作目录内适用的 AGENTS.md。只编写代码、运行检查和修复；Codex 审查，Bridge 最终提交。',
-      '不要 git add、git commit、切换分支、改写历史、push、部署或修改原始项目目录。当前目录是独立 worktree。不要启动子 agent；遇到方案矛盾或必须改变架构时停止并报告。',
+      '你是规划端委派的执行者。完成交接方案，读取并遵循工作目录内适用的 AGENTS.md。只编写代码、运行检查和修复；规划端审查，Bridge 最终提交。',
+      '不要 git add、git commit、切换分支、改写历史、push、部署或修改原始项目目录；提交和 handoff.push 指定的推送都由 Bridge 在审查通过后完成。当前目录是独立 worktree。不要启动子 agent；遇到方案矛盾或必须改变架构时停止并报告。',
       '凭据使用已有 DSH 配置，不能输出凭据。不要访问任务不需要的个人文件。保持变更在 allowedPaths 范围内。',
       JSON.stringify(task.handoff, null, 2), '结束前说明实际修改、验证结果和未解决问题。不要把未通过检查的任务称为完成。',
     ].join('\n');
@@ -367,6 +380,14 @@ export class Engine {
     return { ...this.result(task), wait: { reason: running(task) ? reason : 'ready', elapsedMs: Date.now() - started } };
   }
 
+  async push(value: unknown): Promise<Record<string, unknown>> {
+    const request = pushRequestSchema.parse(value);
+    if (redact(JSON.stringify(request)) !== JSON.stringify(request)) throw new Error('推送请求可能包含凭据，请移除后提交。');
+    const repo = await gitRoot(request.repoPath);
+    const pushed = await pushCommit(repo, request.commit, request.push);
+    return { repoPath: repo, commit: request.commit, ...request.push, remoteCommit: pushed.remoteCommit, output: redact(pushed.output) };
+  }
+
   async cancel(id: string): Promise<Task> {
     let task = await this.task(id);
     if (task.status === 'completed' || task.status === 'cancelled') return task;
@@ -399,6 +420,10 @@ export class Engine {
       };
     }
     else if (task.status === 'awaiting_review') nextAction = { type: 'review' };
+    else if (task.status === 'completed' && task.pushError) nextAction = {
+      type: 'attention',
+      notice: '已在本地提交，但推送失败；处理原因后用 submit_task operation: push 重试，repoPath 为 worktree，commit 为 commit。',
+    };
     else if (task.status === 'completed') nextAction = { type: 'done' };
     return {
       taskId: task.id, status: task.status, nextAction, title: task.handoff.title,
@@ -407,6 +432,7 @@ export class Engine {
       blocked: task.blocked, stalledSince: task.stalledSince,
       checks: task.checks, changedFiles: task.changedFiles, fingerprint: task.fingerprint, diffPath: task.diffPath,
       review: task.review, commit: task.commit, error: task.error, model: task.model,
+      push: task.handoff.push, pushed: task.pushed, pushError: task.pushError,
     };
   }
 }

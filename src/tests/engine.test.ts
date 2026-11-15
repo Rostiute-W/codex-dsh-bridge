@@ -164,3 +164,65 @@ test('cursor 长时间不变且无 blocked 时以 reason stalled 返回', async 
   assert.match(String((stalledResult.nextAction as { notice?: string }).notice), /没有新进展/);
   await engine.cancel(task.id);
 });
+
+async function bareRemote(repo: string): Promise<string> {
+  const remote = path.join(path.dirname(repo), 'remote.git');
+  await git(path.dirname(repo), ['init', '--bare', remote]);
+  await git(repo, ['remote', 'add', 'origin', remote]);
+  return remote;
+}
+
+test('审查通过后由 Bridge 推送到 handoff.push 指定分支', async t => {
+  const { engine, handoff, repo } = await fixture(t, async params => { await writeFile(path.join(params.cwd, 'value.txt'), 'done\n'); });
+  const remote = await bareRemote(repo);
+  const task = await engine.submit({ operation: 'execute', handoff: { ...handoff, push: { remote: 'origin', branch: 'feature/done' } } });
+  const result = await engine.wait(task.id, 60_000);
+  assert.equal(result.status, 'awaiting_review');
+  const completed = await engine.submit({ operation: 'review', taskId: task.id, fingerprint: result.fingerprint, review: { verdict: 'approved', summary: '代码与验收符合方案。', issues: [] } });
+  assert.equal(completed.status, 'completed');
+  assert.equal(completed.pushError, undefined);
+  assert.equal(completed.pushed?.remoteCommit, completed.commit);
+  assert.equal(await git(remote, ['rev-parse', 'refs/heads/feature/done']), completed.commit);
+  assert.deepEqual(engine.result(completed).nextAction, { type: 'done' });
+  assert.equal(await git(repo, ['rev-parse', 'HEAD']), handoff.baseCommit);
+});
+
+test('审查后推送被拒绝时保留本地提交并要求处理', async t => {
+  const { engine, handoff, repo } = await fixture(t, async params => { await writeFile(path.join(params.cwd, 'value.txt'), 'done\n'); });
+  const remote = await bareRemote(repo);
+  const orphan = await git(repo, ['commit-tree', 'HEAD^{tree}', '-m', 'test: unrelated history']);
+  await git(repo, ['push', 'origin', `${orphan}:refs/heads/main`]);
+  const task = await engine.submit({ operation: 'execute', handoff: { ...handoff, push: { remote: 'origin', branch: 'main' } } });
+  const result = await engine.wait(task.id, 60_000);
+  const completed = await engine.submit({ operation: 'review', taskId: task.id, fingerprint: result.fingerprint, review: { verdict: 'approved', summary: '代码与验收符合方案。', issues: [] } });
+  assert.equal(completed.status, 'completed');
+  assert.ok(completed.commit);
+  assert.match(String(completed.pushError), /推送失败/);
+  assert.equal((engine.result(completed).nextAction as { type: string }).type, 'attention');
+  assert.equal(await git(remote, ['rev-parse', 'refs/heads/main']), orphan);
+});
+
+test('push 操作不经过 DSH 推送已有提交，且不强制覆盖分叉历史', async t => {
+  const { engine, handoff, sent, repo } = await fixture(t, async () => {});
+  const remote = await bareRemote(repo);
+  const pushed = await engine.push({ operation: 'push', repoPath: repo, commit: handoff.baseCommit, push: { remote: 'origin', branch: 'main' } });
+  assert.equal(pushed.remoteCommit, handoff.baseCommit);
+  assert.equal(await git(remote, ['rev-parse', 'refs/heads/main']), handoff.baseCommit);
+  assert.equal(sent.length, 0);
+  const orphan = await git(repo, ['commit-tree', 'HEAD^{tree}', '-m', 'test: unrelated history']);
+  await assert.rejects(engine.push({ operation: 'push', repoPath: repo, commit: orphan, push: { remote: 'origin', branch: 'main' } }), /推送失败/);
+  assert.equal(await git(remote, ['rev-parse', 'refs/heads/main']), handoff.baseCommit);
+});
+
+test('推送目标拒绝凭据地址、非 https 地址、未知 remote 和非法分支', async t => {
+  const { engine, handoff, sent, repo } = await fixture(t, async () => {});
+  await bareRemote(repo);
+  const attempt = (remote: string, branch = 'main') => engine.push({ operation: 'push', repoPath: repo, commit: handoff.baseCommit, push: { remote, branch } });
+  await assert.rejects(attempt('https://user:secret@example.invalid/a/b.git'), /不能包含用户名或凭据/);
+  await assert.rejects(attempt('http://example.invalid/a/b.git'), /只支持 https/);
+  await assert.rejects(attempt('git@example.invalid:a/b.git'), /只支持 https/);
+  await assert.rejects(attempt('upstream'), /没有名为 upstream/);
+  for (const branch of ['-f', '+main', 'a..b', 'main:other', 'x.lock']) await assert.rejects(attempt('origin', branch), /无效的推送分支/);
+  await assert.rejects(engine.submit({ operation: 'execute', handoff: { ...handoff, push: { remote: 'upstream', branch: 'main' } } }), /没有名为 upstream/);
+  assert.equal(sent.length, 0);
+});

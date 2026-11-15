@@ -15,14 +15,18 @@ export function validateRelative(file: string): string {
   if (!normalized || path.isAbsolute(file) || normalized.split('/').some(part => !part || part === '..' || part === '.' || part.toLowerCase() === '.git' || /[. ]$/.test(part)) || /[:\0-\x1f]/.test(file)) throw new Error(`无效的任务相对路径：${file}`);
   return normalized;
 }
-export async function prepareWorktree(task: Task, taskDir: string): Promise<void> {
-  const repo = await realpath(task.handoff.repoPath);
+export async function gitRoot(repoPath: string): Promise<string> {
+  const repo = await realpath(repoPath);
   const root = await realpath(await git(repo, ['rev-parse', '--show-toplevel']));
   if (repo.toLowerCase() !== root.toLowerCase()) throw new Error('repoPath 必须是项目 Git 根目录。');
+  return repo;
+}
+export async function prepareWorktree(task: Task, taskDir: string): Promise<void> {
+  const repo = await gitRoot(task.handoff.repoPath);
   const dirty = await git(repo, ['status', '--porcelain']);
   if (dirty) throw new Error('项目存在未提交修改。请先保留或提交用户修改，再重新提交任务；软件不会自动暂存它们。');
   const head = await git(repo, ['rev-parse', 'HEAD']);
-  if (head !== task.handoff.baseCommit) throw new Error('代码基准与当前 HEAD 不一致，请让 Codex 重新核对方案。');
+  if (head !== task.handoff.baseCommit) throw new Error('代码基准与当前 HEAD 不一致，请重新核对方案。');
   task.handoff.allowedPaths.forEach(validateRelative);
   await mkdir(taskDir, { recursive: true });
   task.worktree = path.join(taskDir, 'workspace');
@@ -90,4 +94,37 @@ export async function finishCommit(task: Task): Promise<void> {
   const commitStatus = await git(task.worktree!, ['status', '--short']);
   if (await git(task.worktree!, ['rev-parse', 'HEAD^{tree}']) !== expectedTree) throw new Error('Git hook 修改了已审查的提交内容。提交哈希已保留，请人工检查。');
   if (commitStatus) throw new Error('提交后工作区还有修改，请人工检查。');
+}
+export interface PushTarget { remote: string; branch: string }
+export async function validatePushTarget(cwd: string, target: PushTarget): Promise<void> {
+  const { remote, branch } = target;
+  if (/^https:\/\//i.test(remote)) {
+    let url: URL;
+    try { url = new URL(remote); } catch { throw new Error(`无效的推送地址：${remote}`); }
+    if (url.username || url.password) throw new Error('推送地址不能包含用户名或凭据，请通过 Git 凭据管理器登录。');
+    if (url.search || url.hash || !url.hostname) throw new Error(`无效的推送地址：${remote}`);
+  } else if (/^[a-z][a-z0-9+.-]*:/i.test(remote) || remote.includes('@')) {
+    throw new Error('推送地址只支持 https://，或仓库中已配置的 remote 名称。');
+  } else if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/.test(remote) || !(await git(cwd, ['remote'])).split(/\r?\n/).includes(remote)) {
+    throw new Error(`仓库中没有名为 ${remote} 的 remote，可以改传 https 地址。`);
+  }
+  if (!/^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$/.test(branch)) throw new Error(`无效的推送分支：${branch}`);
+  await git(cwd, ['check-ref-format', `refs/heads/${branch}`]).catch(() => { throw new Error(`无效的推送分支：${branch}`); });
+}
+// 只做快进推送：refspec 不带 +、不加 --force，远程已有分叉提交时由 Git 拒绝。
+export async function pushCommit(cwd: string, commit: string, target: PushTarget): Promise<{ remoteCommit: string; output: string }> {
+  await validatePushTarget(cwd, target);
+  if (!/^[a-f0-9]{40,64}$/i.test(commit)) throw new Error('commit 必须是完整提交号。');
+  const resolved = await git(cwd, ['rev-parse', '--verify', `${commit}^{commit}`]).catch(() => { throw new Error(`仓库中找不到提交 ${commit}。`); });
+  if (resolved.toLowerCase() !== commit.toLowerCase()) throw new Error(`仓库中找不到提交 ${commit}。`);
+  const ref = `refs/heads/${target.branch}`;
+  // 关闭终端提示，避免无人值守时卡在命令行输入；凭据管理器的图形登录不受影响。
+  const env = cleanEnvironment({ GIT_TERMINAL_PROMPT: '0' });
+  const pushed = await runProcess('git', ['-C', cwd, 'push', '--porcelain', '--no-follow-tags', target.remote, `${resolved}:${ref}`], { env, timeoutMs: 300_000 });
+  if (pushed.code !== 0) throw new Error(`推送失败（不会强制推送）：${pushed.output.slice(-3000)}`);
+  const listed = await runProcess('git', ['-C', cwd, 'ls-remote', target.remote, ref], { env, timeoutMs: 120_000 });
+  if (listed.code !== 0) throw new Error(`推送后读取远程分支失败：${listed.output.slice(-3000)}`);
+  const remoteCommit = listed.stdout.split(/\s+/)[0] ?? '';
+  if (remoteCommit.toLowerCase() !== resolved.toLowerCase()) throw new Error(`推送后远程 ${ref} 为 ${remoteCommit || '(不存在)'}，与 ${resolved} 不一致。`);
+  return { remoteCommit, output: pushed.output.slice(-4000) };
 }
