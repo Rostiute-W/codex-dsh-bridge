@@ -84,14 +84,14 @@ export async function finishCommit(task: Task): Promise<void> {
       if (/\b(?:sk|ds)[-_][A-Za-z0-9_-]{24,}\b/.test(bytes.toString('utf8'))) throw new Error(`文件可能包含真实 API 凭据：${file}，请人工核对。`);
     } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
   }
-  const stagedPreview = await git(task.worktree!, ['diff', 'HEAD']);
+  const stagedPreview = await git(task.worktree!, ['diff', '--no-ext-diff', '--no-textconv', 'HEAD']);
   if (stagedPreview.length > 10_000_000) throw new Error('变更过大，请拆分任务。');
   await git(task.worktree!, ['add', '--', ...current.files]);
   const stagedFiles = (await git(task.worktree!, ['diff', '--cached', '--no-renames', '--name-only', '-z'])).split('\0').filter(Boolean).sort();
   if (JSON.stringify(stagedFiles) !== JSON.stringify(current.files)) throw new Error('暂存文件与审查范围不一致，保留索引供人工检查。');
   if ((await snapshot(task, true)).fingerprint !== task.reviewedFingerprint) throw new Error('暂存期间代码发生变化，必须重新验证和审查。');
-  await git(task.worktree!, ['diff', '--cached', '--check']);
-  await git(task.worktree!, ['diff', '--cached']);
+  await git(task.worktree!, ['diff', '--cached', '--no-ext-diff', '--no-textconv', '--check']);
+  await git(task.worktree!, ['diff', '--cached', '--no-ext-diff', '--no-textconv']);
   const expectedTree = await git(task.worktree!, ['write-tree']);
   await git(task.worktree!, ['commit', '-m', task.handoff.commitMessage]);
   task.commit = await git(task.worktree!, ['rev-parse', 'HEAD']);

@@ -343,4 +343,17 @@ test('Codex 重复安装校验 DSH_PATH、DSH_HOME 与 tool_timeout_sec，变更
   assert.equal(changedHome.code, 0, changedHome.output);
   const afterHome2 = await readFile(codexConfig, 'utf8');
   assert.ok(afterHome2.includes(dshHomeDir2) || afterHome2.includes(dshHomeDir2.replace(/\\/g, '\\\\')));
+
+  // 重新注册时必须保留用户手工写入的 DSH_MODEL、BRIDGE_TIMEOUT_MINUTES 等非托管 env 键。
+  await writeFile(
+    codexConfig,
+    afterHome2.replace(/env = \{ ([^}]+) \}/, "env = { $1, DSH_MODEL = 'magpie/custom-model', BRIDGE_TIMEOUT_MINUTES = '180' }"),
+    'utf8',
+  );
+  const preserved = await runInstall(['--dsh', dshCmd], { CODEX_HOME: codexHomeDir, DSH_HOME: dshHomeDir2 });
+  assert.equal(preserved.code, 0, preserved.output);
+  const afterPreserved = await readFile(codexConfig, 'utf8');
+  assert.ok(afterPreserved.includes(dshCmd) || afterPreserved.includes(dshCmd.replace(/\\/g, '\\\\')));
+  assert.match(afterPreserved, /DSH_MODEL\s*=\s*["']magpie\/custom-model["']/);
+  assert.match(afterPreserved, /BRIDGE_TIMEOUT_MINUTES\s*=\s*["']180["']/);
 });

@@ -100,6 +100,7 @@ export function nativeController(ctx, dataRoot) {
         ||typeof params.title!=='string'||!params.title.trim()||params.title.length>160)throw new Error('原生交接参数超出范围。');
       if((typeof params.prompt!=='string'||!params.prompt.trim()||params.prompt.length>256000
         ||typeof params.requestId!=='string'||!params.requestId.trim()||params.requestId.length>160))throw new Error('原生提示词超出范围。');
+      const assertNotAborted=()=>{if(signal?.aborted)throw Object.assign(new Error('请求在提交前已取消。'),{code:'request/aborted-before-submit'});};
       const selected = params.model == null ? undefined : modelSelection(params.model);
       const attached=ctx.agents.get(id);
       await ctx.sessionController.create({sessionId:id,cwd:expected});
@@ -117,11 +118,12 @@ export function nativeController(ctx, dataRoot) {
           if (!model || selected.reasoningEffort && !model.reasoning?.efforts.some(effort => effort.id === selected.reasoningEffort)) throw modelUnavailable();
           const current = await state(params.taskId);
           if (current.status !== 'idle' || current.pending) throw Object.assign(new Error('会话正在运行。'),{code:'session/agent-busy'});
+          assertNotAborted();
           await ctx.sessionController.selectModel({sessionId:id,...selected});
         }
       }
       const before=await state(params.taskId);
-      if(signal?.aborted)throw Object.assign(new Error('请求在提交前已取消。'),{code:'request/aborted-before-submit'});
+      assertNotAborted();
       // Host 公共服务入口要求调用方提供 AbortSignal。
       await ctx.sessionController.prompt({sessionId:id,requestId:params.requestId,content:[{type:'text',text:params.prompt}],mode:'followup',clientTimeZone:'Asia/Shanghai'},signal ?? new AbortController().signal);
       focus={seq:focus.seq+1,sessionId:id};
@@ -146,7 +148,7 @@ export async function apply(ctx) {
     const requestAbort = new AbortController();
     let responded = false;
     socket.setEncoding('utf8');
-    socket.setTimeout(130_000, () => { if (!responded) requestAbort.abort('timeout'); socket.destroy(); });
+    socket.setTimeout(15_000, () => { if (!responded) requestAbort.abort('timeout'); socket.destroy(); });
     socket.on('error', () => { if (!responded) requestAbort.abort('error'); });
     socket.on('close', () => { sockets.delete(socket); if (!responded) requestAbort.abort('close'); });
     let data = '', size = 0, received = false;
@@ -164,6 +166,7 @@ export async function apply(ctx) {
           const packet = JSON.parse(data.slice(0, end));
           id = packet.id; method = packet.method;
           if (!uuid.test(id) || !['models', 'send', 'inspect', 'cancel'].includes(method)) throw new Error('无效管道请求。');
+          if (method === 'send') socket.setTimeout(130_000);
           const result = await controller.call(method, packet.params, requestAbort.signal);
           const response = JSON.stringify({ id, result }) + '\n';
           if (Buffer.byteLength(response) > 8 * 1024 * 1024) throw new Error('响应过大。');

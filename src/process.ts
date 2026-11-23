@@ -74,12 +74,13 @@ export async function runProcess(command: string, args: string[], options: {
       }, 5_000);
     };
     const stop = () => {
-      if (settled) return;
+      if (settled || stopped) return;
       stopped = true;
       scheduleGrace();
-      if (!child.pid) return;
+      // 子进程已退出时不再按 PID 强杀，避免 PID 复用误杀无关进程树。
+      if (!child.pid || child.exitCode !== null || child.signalCode !== null) return;
       if (process.platform !== 'win32') {
-        if (child.exitCode === null) child.kill('SIGTERM');
+        child.kill('SIGTERM');
         return;
       }
       const fallbackKill = () => { try { child.kill(); } catch { /* 忽略已退出进程 */ } };
@@ -91,7 +92,6 @@ export async function runProcess(command: string, args: string[], options: {
     const timer = setTimeout(() => { timedOut = true; stop(); }, options.timeoutMs ?? 120_000);
     options.signal?.addEventListener('abort', onAbort, { once: true });
     if (options.signal?.aborted) stop();
-    child.once('exit', () => { if (stopped) scheduleGrace(); });
     child.once('error', error => settleReject(error));
     child.once('close', code => {
       if (options.signal?.aborted || timedOut) settleReject(abortOrTimeoutError());

@@ -49,7 +49,7 @@ export function redact(text: string): string {
   return text
     .replace(/\b(?:sk|ds)[-_][a-zA-Z0-9_-]{16,}\b/g, '[已隐藏凭据]')
     .replace(
-      /(\b(?:api[_-]?key|access[_-]?token|authorization)(?:\\?["'])?[ \t]*[:=][ \t]*)(?:(\\["'])(?:(?!\2)[^\r\n])+?(?=\2)|(["'])(?:\\[^\r\n]|(?!\3)[^\r\n])+?(?=\3)|(?![\\"'])(?:(?:Bearer|Basic|Token|Digest|OAuth|ApiKey|Api-Key|DPoP|Negotiate|AWS4-HMAC-SHA256|Bot|Key)[ \t]+)?[^\s,;'"&}\])<>]+)/gi,
+      /((?:api[_-]?key|access[_-]?token|authorization)(?:\\?["'])?\s*[:=]\s*)(?:(\\["'])(?:(?!\2)[^\r\n])+|(["'])(?:\\[^\r\n]|(?!\3)[^\r\n])+|(?![\\"'])(?:Digest[ \t]+[^\r\n']+|(?:Bearer|Basic|Token|OAuth|ApiKey|Api-Key|DPoP|Negotiate|AWS4-HMAC-SHA256|Bot|Key)[ \t]+(?:(?!\\["'])[^\r\n"'])+|[^\s,;'"&}\])<>]+))/gi,
       (_match, prefix: string, escapedQuote?: string, quote?: string) => `${prefix}${escapedQuote ?? quote ?? ''}[已隐藏凭据]`,
     );
 }
@@ -113,7 +113,8 @@ export class Engine {
             delete task.error;
           } catch (error) { task.status = 'needs_attention'; task.error = safeError(error); }
           if (task.status === 'completed' && task.handoff.push) {
-            // 提交已落盘，推送前先持久化 completed，避免长推送中断留下 awaiting_review。
+            // 提交已落盘，推送前先持久化 completed 与未确认提示，避免推送中断后误报为 done。
+            task.pushError = '提交已完成，但推送尚未完成或中途中断，结果未确认；请核实远程分支后用 submit_task operation: push 非强制重推。';
             await this.store.save(task);
             try {
               const pushed = await pushCommit(task.worktree!, task.commit!, task.handoff.push);
@@ -194,7 +195,7 @@ export class Engine {
     ].join('\n');
   }
 
-  private async send(task: Task, prompt: string, persist = () => this.store.save(task)): Promise<void> {
+  private async send(task: Task, prompt: string, persist = () => this.store.save(task), signal?: AbortSignal): Promise<void> {
     const model = parseModel(task.model ?? '');
     if (model) validateModel(model, await this.client.models());
     // 先持久化运行状态，响应丢失时接管者只观察原会话，不自动重发提示词。
@@ -204,7 +205,10 @@ export class Engine {
     task.checks = [];
     await persist();
     const requestId = task.id + '-' + createHash('sha256').update(`${task.round}\n${prompt}`).digest('hex');
-    const started = await this.client.send({ taskId: task.id, cwd: task.worktree!, title: task.handoff.title, prompt, requestId, model });
+    const started = await this.client.send(
+      { taskId: task.id, cwd: task.worktree!, title: task.handoff.title, prompt, requestId, model },
+      { signal, timeoutMs: Math.min(120_000, Math.max(1, task.deadline - Date.now())) },
+    );
     task.sessionId = started.sessionId; task.beforeSeq = started.beforeSeq;
     await persist();
   }
@@ -319,7 +323,7 @@ export class Engine {
         } else {
           task.round++;
           await persist();
-          await this.send(task, '修复以下真实验收失败，保持原方案与 allowedPaths，不暂存、不提交：\n' + JSON.stringify(task.checks.filter(check => check.exitCode !== 0)), persist);
+          await this.send(task, '修复以下真实验收失败，保持原方案与 allowedPaths，不暂存、不提交：\n' + JSON.stringify(task.checks.filter(check => check.exitCode !== 0)), persist, controller.signal);
           lastCursor = undefined; lastCursorAt = Date.now();
           continue;
         }
@@ -329,17 +333,24 @@ export class Engine {
       if (controller.signal.reason === 'cancelled' || (await this.task(task.id)).status === 'cancelled') return;
       task.status = 'needs_attention';
       if (controller.signal.reason === 'timeout' || remaining <= 0) {
+        const pendingError = '任务超过总运行时限，现场已保留（正在通知 DSH 停止当前轮次）。';
+        task.error = pendingError;
+        await this.store.save(task);
+        let finalError: string;
         try {
           await this.client.cancel(task.id);
-          task.error = '任务超过总运行时限，现场已保留（已确认通知 DSH 停止当前轮次）。';
+          finalError = '任务超过总运行时限，现场已保留（已确认通知 DSH 停止当前轮次）。';
         } catch (cancelError) {
-          task.error = `任务超过总运行时限，现场已保留（未能确认 DSH 原生会话已停止：${safeError(cancelError)}）。`;
+          finalError = `任务超过总运行时限，现场已保留（未能确认 DSH 原生会话已停止：${safeError(cancelError)}）。`;
         }
+        const latest = await this.task(task.id);
+        if (latest.status !== 'needs_attention' || latest.error !== pendingError) return;
+        task.error = finalError;
+        await this.store.save(task);
       } else {
         task.error = safeError(error);
+        await this.store.save(task);
       }
-      if ((await this.task(task.id)).status === 'cancelled') return;
-      await this.store.save(task);
     } finally { clearTimeout(timer); }
   }
 
