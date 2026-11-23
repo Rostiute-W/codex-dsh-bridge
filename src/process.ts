@@ -40,23 +40,62 @@ export async function runProcess(command: string, args: string[], options: {
   child.stderr.on('data', value => capture(value, 'stderr'));
   child.stdin.on('error', () => {});
   child.stdin.end();
-  const stop = () => {
-    if (!child.pid || child.exitCode !== null) return;
-    if (process.platform !== 'win32') { child.kill('SIGTERM'); return; }
-    const killer = spawn('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' });
-    killer.on('error', () => child.kill());
-  };
-  const timer = setTimeout(() => { timedOut = true; stop(); }, options.timeoutMs ?? 120_000);
-  options.signal?.addEventListener('abort', stop, { once: true });
-  if (options.signal?.aborted) stop();
   return new Promise((resolve, reject) => {
-    const cleanup = () => { clearTimeout(timer); options.signal?.removeEventListener('abort', stop); };
-    child.once('error', error => { cleanup(); reject(error); });
-    child.once('close', code => {
+    let settled = false;
+    let stopped = false;
+    let graceTimer: NodeJS.Timeout | undefined;
+    const cleanup = () => {
+      clearTimeout(timer);
+      if (graceTimer) clearTimeout(graceTimer);
+      options.signal?.removeEventListener('abort', onAbort);
+    };
+    const settleReject = (error: unknown) => {
+      if (settled) return;
+      settled = true;
       cleanup();
-      if (options.signal?.aborted) reject(new Error('操作已取消。'));
-      else if (timedOut) reject(new Error('命令运行超时，已终止进程树。'));
-      else resolve({ code: code ?? -1, output, stdout, stderr, truncated });
+      reject(error);
+    };
+    const settleResolve = (value: { code: number; output: string; stdout: string; stderr: string; truncated: boolean }) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(value);
+    };
+    const abortOrTimeoutError = () =>
+      options.signal?.aborted ? new Error('操作已取消。') : new Error('命令运行超时，已终止进程树。');
+    const scheduleGrace = () => {
+      if (settled || graceTimer) return;
+      // 子进程已退出但孙进程仍占用 stdio 时，宽限期后主动销毁管道并结束等待。
+      graceTimer = setTimeout(() => {
+        child.stdin.destroy();
+        child.stdout.destroy();
+        child.stderr.destroy();
+        settleReject(abortOrTimeoutError());
+      }, 5_000);
+    };
+    const stop = () => {
+      if (settled) return;
+      stopped = true;
+      scheduleGrace();
+      if (!child.pid) return;
+      if (process.platform !== 'win32') {
+        if (child.exitCode === null) child.kill('SIGTERM');
+        return;
+      }
+      const fallbackKill = () => { try { child.kill(); } catch { /* 忽略已退出进程 */ } };
+      const killer = spawn('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' });
+      killer.once('error', fallbackKill);
+      killer.once('close', code => { if (code !== 0) fallbackKill(); });
+    };
+    const onAbort = () => stop();
+    const timer = setTimeout(() => { timedOut = true; stop(); }, options.timeoutMs ?? 120_000);
+    options.signal?.addEventListener('abort', onAbort, { once: true });
+    if (options.signal?.aborted) stop();
+    child.once('exit', () => { if (stopped) scheduleGrace(); });
+    child.once('error', error => settleReject(error));
+    child.once('close', code => {
+      if (options.signal?.aborted || timedOut) settleReject(abortOrTimeoutError());
+      else settleResolve({ code: code ?? -1, output, stdout, stderr, truncated });
     });
   });
 }

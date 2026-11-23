@@ -48,7 +48,10 @@ export function validateModel(selection: Model, catalog: ModelCatalog): void {
   if (selection.reasoningEffort && !model.reasoning?.efforts.some(effort => effort.id === selection.reasoningEffort)) throw new Error('所选模型不支持此推理强度。');
 }
 
-function request(method: string, params: unknown): Promise<unknown> {
+const defaultTimeoutMs = 15_000;
+const sendTimeoutMs = 120_000;
+
+function request(method: string, params: unknown, timeoutMs = defaultTimeoutMs): Promise<unknown> {
   const normalizedHome = path.normalize(dshHome).toLowerCase();
   const name = createHash('sha256').update(os.userInfo().username + normalizedHome).digest('hex').slice(0, 24);
   return new Promise((resolve, reject) => {
@@ -60,7 +63,7 @@ function request(method: string, params: unknown): Promise<unknown> {
       settled = true; clearTimeout(timer); socket.destroy();
       if (error) reject(error); else resolve(result);
     };
-    const timer = setTimeout(() => finish(new Error('DSH 管道请求超过 15 秒，现场已保留。')), 15_000);
+    const timer = setTimeout(() => finish(new Error(`DSH 管道请求超过 ${Math.round(timeoutMs / 1000)} 秒，现场已保留。`)), timeoutMs);
     socket.setEncoding('utf8');
     socket.once('connect', () => socket.write(JSON.stringify({ id, method, params }) + '\n'));
     socket.on('data', (chunk: string) => {
@@ -101,17 +104,17 @@ async function ensureConnection(): Promise<void> {
   await startup;
 }
 
-async function nativeRequest(method: string, params: unknown): Promise<unknown> {
-  try { return await request(method, params); }
+async function nativeRequest(method: string, params: unknown, timeoutMs = defaultTimeoutMs): Promise<unknown> {
+  try { return await request(method, params, timeoutMs); }
   catch (error) { if (!missingPipe(error)) throw error; }
   // 只有尚未建立连接时才启动 DSH；已发出的请求超时不能自动重发。
   await ensureConnection();
-  return request(method, params);
+  return request(method, params, timeoutMs);
 }
 
 export const dsh: DshClient = {
   async models() { return await nativeRequest('models', {}) as ModelCatalog; },
-  async send(params) { return await nativeRequest('send', params) as { sessionId: string; beforeSeq: number }; },
+  async send(params) { return await nativeRequest('send', params, sendTimeoutMs) as { sessionId: string; beforeSeq: number }; },
   async inspect(taskId) { return await nativeRequest('inspect', { taskId }) as NativeState; },
   async cancel(taskId) { return nativeRequest('cancel', { taskId }); },
 };

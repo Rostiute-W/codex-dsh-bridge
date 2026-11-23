@@ -46,6 +46,7 @@ export function nativeFailureMessage(method,error) {
     'session/attachment-invalid':'DSH 拒绝消息附件。',
     'gateway/bad-request':'DSH 拒绝请求参数。',
     'gateway/internal':'DSH 内部服务失败。',
+    'request/aborted-before-submit':'管道连接已关闭或超时，已取消提交。',
   };
   const code=Object.hasOwn(reasons,error?.code)?error.code:error?.name==='TypeError'?'interface/type-error':'unknown';
   return `DSH 原生操作失败（${operation} / ${code}）：${reasons[code] ?? '请检查连接插件与 DSH 版本及会话状态。'}`;
@@ -89,7 +90,7 @@ export function nativeController(ctx, dataRoot) {
         ...(blocked?{blocked}:{})};
     } finally {observation[Symbol.dispose]();}
   };
-  return {focus:()=>focus,async call(method,params) {
+  return {focus:()=>focus,async call(method,params,signal) {
     if(method==='models')return modelCatalog(ctx);
     if(!params||!uuid.test(params.taskId))throw new Error('无效的任务 ID。');
     const id=sessionId(params.taskId);
@@ -120,8 +121,9 @@ export function nativeController(ctx, dataRoot) {
         }
       }
       const before=await state(params.taskId);
+      if(signal?.aborted)throw Object.assign(new Error('请求在提交前已取消。'),{code:'request/aborted-before-submit'});
       // Host 公共服务入口要求调用方提供 AbortSignal。
-      await ctx.sessionController.prompt({sessionId:id,requestId:params.requestId,content:[{type:'text',text:params.prompt}],mode:'followup',clientTimeZone:'Asia/Shanghai'},new AbortController().signal);
+      await ctx.sessionController.prompt({sessionId:id,requestId:params.requestId,content:[{type:'text',text:params.prompt}],mode:'followup',clientTimeZone:'Asia/Shanghai'},signal ?? new AbortController().signal);
       focus={seq:focus.seq+1,sessionId:id};
       return {sessionId:id,beforeSeq:before.cursor};
     }
@@ -141,10 +143,12 @@ export async function apply(ctx) {
   const sockets = new Set();
   const server = net.createServer(socket => {
     sockets.add(socket);
+    const requestAbort = new AbortController();
+    let responded = false;
     socket.setEncoding('utf8');
-    socket.setTimeout(15000, () => socket.destroy());
-    socket.on('error', () => {});
-    socket.on('close', () => sockets.delete(socket));
+    socket.setTimeout(130_000, () => { if (!responded) requestAbort.abort('timeout'); socket.destroy(); });
+    socket.on('error', () => { if (!responded) requestAbort.abort('error'); });
+    socket.on('close', () => { sockets.delete(socket); if (!responded) requestAbort.abort('close'); });
     let data = '', size = 0, received = false;
     socket.on('data', chunk => {
       if (received) return;
@@ -160,11 +164,13 @@ export async function apply(ctx) {
           const packet = JSON.parse(data.slice(0, end));
           id = packet.id; method = packet.method;
           if (!uuid.test(id) || !['models', 'send', 'inspect', 'cancel'].includes(method)) throw new Error('无效管道请求。');
-          const result = await controller.call(method, packet.params);
+          const result = await controller.call(method, packet.params, requestAbort.signal);
           const response = JSON.stringify({ id, result }) + '\n';
           if (Buffer.byteLength(response) > 8 * 1024 * 1024) throw new Error('响应过大。');
+          responded = true;
           if (!socket.destroyed) socket.end(response);
         } catch (error) {
+          responded = true;
           if (!socket.destroyed) socket.end(JSON.stringify({ id, error: nativeFailureMessage(method, error) }) + '\n');
         }
       })();

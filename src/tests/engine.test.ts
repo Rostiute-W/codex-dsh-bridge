@@ -1,9 +1,9 @@
 import { test, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, readFile, rename, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { Engine, type Handoff } from '../engine.js';
+import { Engine, redact, type Handoff, type Task } from '../engine.js';
 import { Store } from '../store.js';
 import { git } from '../git.js';
 import type { DshClient, Send, NativeState } from '../dsh.js';
@@ -11,8 +11,12 @@ import type { DshClient, Send, NativeState } from '../dsh.js';
 async function fixture(
   t: TestContext,
   modify: (params: Send, round: number) => Promise<void>,
-  command = "if (-not (Test-Path 'value.txt')) { exit 1 }",
+  command: string | string[] = "if (-not (Test-Path 'value.txt')) { exit 1 }",
   onInspect?: (taskId: string, base: NativeState) => Promise<NativeState> | NativeState,
+  options?: {
+    onCancel?: (taskId: string) => Promise<unknown> | unknown;
+    store?: (dataDir: string) => Store;
+  },
 ) {
   const temporary = await mkdtemp(path.join(os.tmpdir(), 'codex-dsh-engine-'));
   t.after(() => rm(temporary, { recursive: true, force: true }));
@@ -40,13 +44,14 @@ async function fixture(
       const base: NativeState = { sessionId: `session-codex-${taskId}`, status: 'idle', pending: 0, cursor, endSeq: cursor, reason: 'completed', summary: '假 DSH 已完成修改。', guidance: [] };
       return onInspect ? await onInspect(taskId, base) : base;
     },
-    async cancel() { return { ok: true }; },
+    async cancel(taskId) { return options?.onCancel ? await options.onCancel(taskId) : { ok: true }; },
   };
-  const engine = new Engine(new Store(path.join(temporary, 'data')), client);
+  const dataDir = path.join(temporary, 'data');
+  const engine = new Engine(options?.store ? options.store(dataDir) : new Store(dataDir), client);
   const handoff: Handoff = {
     requestId: 'engine-test-request', title: '临时仓库交接', repoPath: repo, baseCommit: await git(repo, ['rev-parse', 'HEAD']), ready: true,
     goal: '在允许范围内完成文件修改并验收。', plan: '修改 value.txt，执行给定验收，保留变更等待 Codex 审查。', constraints: [],
-    allowedPaths: ['value.txt'], validationCommands: [command], acceptanceCriteria: ['允许范围内的变更通过验收。'],
+    allowedPaths: ['value.txt'], validationCommands: Array.isArray(command) ? command : [command], acceptanceCriteria: ['允许范围内的变更通过验收。'],
     commitMessage: 'feat: update allowed value', model: '',
   };
   return { engine, handoff, sent, repo };
@@ -225,4 +230,182 @@ test('推送目标拒绝凭据地址、非 https 地址、未知 remote 和非�
   for (const branch of ['-f', '+main', 'a..b', 'main:other', 'x.lock']) await assert.rejects(attempt('origin', branch), /无效的推送分支/);
   await assert.rejects(engine.submit({ operation: 'execute', handoff: { ...handoff, push: { remote: 'upstream', branch: 'main' } } }), /没有名为 upstream/);
   assert.equal(sent.length, 0);
+});
+
+test('允许范围内的文件重命名可以通过审查并提交', async t => {
+  const { engine, handoff } = await fixture(
+    t,
+    async params => { await rename(path.join(params.cwd, 'baseline.txt'), path.join(params.cwd, 'renamed.txt')); },
+    "if (-not (Test-Path 'renamed.txt') -or (Test-Path 'baseline.txt')) { exit 1 }",
+  );
+  const task = await engine.submit({ operation: 'execute', handoff: { ...handoff, allowedPaths: ['baseline.txt', 'renamed.txt'] } });
+  const result = await engine.wait(task.id, 60_000);
+  assert.equal(result.status, 'awaiting_review');
+  const completed = await engine.submit({ operation: 'review', taskId: task.id, fingerprint: result.fingerprint, review: { verdict: 'approved', summary: '重命名符合方案。', issues: [] } });
+  assert.equal(completed.status, 'completed', completed.error);
+  assert.equal(completed.commit, await git(completed.worktree!, ['rev-parse', 'HEAD']));
+  assert.equal(await git(completed.worktree!, ['status', '--short']), '');
+  assert.equal(await git(completed.worktree!, ['ls-tree', '--name-only', 'HEAD']), 'renamed.txt');
+});
+
+test('redact 隐藏 Header、key=value、JSON 与 sk/ds 凭据且不泄露 token', () => {
+  const header = redact('Authorization: Bearer abcdef123456TOKENVALUE');
+  assert.equal(header, 'Authorization: [已隐藏凭据]');
+  assert.equal(header.includes('TOKENVALUE'), false);
+
+  assert.equal(redact('Authorization: Basic dXNlcjpwYXNz=='), 'Authorization: [已隐藏凭据]');
+  assert.equal(redact('curl -H "Authorization: Bearer tok987654" https://example.com'), 'curl -H "Authorization: [已隐藏凭据]" https://example.com');
+  assert.equal(redact('{"authorization":"Bearer abcdef123456TOKENVALUE"}'), '{"authorization":"[已隐藏凭据]"}');
+  assert.equal(redact('{"api_key": "my-secret-key", "access_token": "tok_xyz"}'), '{"api_key": "[已隐藏凭据]", "access_token": "[已隐藏凭据]"}');
+  assert.equal(redact('api_key=rawSecret123&access_token=rawTok456'), 'api_key=[已隐藏凭据]&access_token=[已隐藏凭据]');
+  const escaped = redact(JSON.stringify({ msg: '{"authorization":"Bearer nestedSecret999"}' }));
+  assert.equal(escaped.includes('nestedSecret999'), false);
+  assert.equal(redact('key sk-1234567890abcdef1234 and ds_1234567890abcdef1234'), 'key [已隐藏凭据] and [已隐藏凭据]');
+  assert.equal(redact('{"api_key": ""}'), '{"api_key": ""}');
+});
+
+test('验收命令重复修改工作区时拒绝发布并报错', async t => {
+  const { engine, handoff } = await fixture(
+    t,
+    async params => { await writeFile(path.join(params.cwd, 'value.txt'), 'init\n'); },
+    "Add-Content -Path 'value.txt' -Value 'mutated'",
+  );
+  const task = await engine.submit({ operation: 'execute', handoff });
+  const result = await engine.wait(task.id, 60_000);
+  assert.equal(result.status, 'needs_attention');
+  assert.equal(result.fingerprint, undefined);
+  assert.match(String(result.error), /验收命令/);
+});
+
+test('验收命令一次性修改工作区后重跑全套验收，不放行旧树上的误通过', async t => {
+  const { engine, handoff, sent } = await fixture(
+    t,
+    async (params, round) => { await writeFile(path.join(params.cwd, 'value.txt'), round === 1 ? 'raw' : 'formatted'); },
+    [
+      "if ((Get-Content -Raw 'value.txt').Trim() -ne 'raw') { exit 1 }",
+      "Set-Content -Path 'value.txt' -Value 'formatted' -NoNewline",
+    ],
+  );
+  const task = await engine.submit({ operation: 'execute', handoff });
+  const result = await engine.wait(task.id, 60_000);
+  // 第一轮 cmd2 把 raw 改成了 formatted，重跑时 cmd1 在 formatted 上失败，不应直接进入 awaiting_review。
+  assert.equal(result.status, 'needs_changes');
+  assert.ok(sent.length >= 2);
+});
+
+test('cancel 时若 DSH 取消失败则标为 needs_attention 而非 cancelled', async t => {
+  const { engine, handoff } = await fixture(
+    t,
+    async () => {},
+    undefined,
+    (_taskId, base) => ({ ...base, status: 'running', cursor: 1, endSeq: 0 }),
+    { onCancel: async () => { throw new Error('pipe unavailable'); } },
+  );
+  const task = await engine.submit({ operation: 'execute', handoff });
+  const cancelled = await engine.cancel(task.id);
+  assert.equal(cancelled.status, 'needs_attention');
+  assert.match(String(cancelled.error), /未能确认.*取消|DSH/);
+});
+
+test('drive 超时时调用 DSH cancel 并在 error 中记录停止是否已确认', async t => {
+  const previous = process.env.BRIDGE_TIMEOUT_MINUTES;
+  process.env.BRIDGE_TIMEOUT_MINUTES = '0.002';
+  t.after(() => {
+    if (previous === undefined) delete process.env.BRIDGE_TIMEOUT_MINUTES;
+    else process.env.BRIDGE_TIMEOUT_MINUTES = previous;
+  });
+
+  const confirmedCalls: string[] = [];
+  const okFixture = await fixture(
+    t,
+    async () => {},
+    undefined,
+    (_taskId, base) => ({ ...base, status: 'running', cursor: 1, endSeq: 0 }),
+    { onCancel: async id => { confirmedCalls.push(id); return { ok: true }; } },
+  );
+  const task1 = await okFixture.engine.submit({ operation: 'execute', handoff: okFixture.handoff });
+  const res1 = await okFixture.engine.wait(task1.id, 60_000);
+  assert.equal(res1.status, 'needs_attention');
+  assert.deepEqual(confirmedCalls, [task1.id]);
+  assert.match(String(res1.error), /超时|总运行时限/);
+  assert.match(String(res1.error), /已确认.*停止/);
+
+  const failedCalls: string[] = [];
+  const failFixture = await fixture(
+    t,
+    async () => {},
+    undefined,
+    (_taskId, base) => ({ ...base, status: 'running', cursor: 1, endSeq: 0 }),
+    { onCancel: async id => { failedCalls.push(id); throw new Error('cancel timeout'); } },
+  );
+  const task2 = await failFixture.engine.submit({ operation: 'execute', handoff: { ...failFixture.handoff, requestId: 'engine-timeout-cancel-fail' } });
+  const res2 = await failFixture.engine.wait(task2.id, 60_000);
+  assert.equal(res2.status, 'needs_attention');
+  assert.deepEqual(failedCalls, [task2.id]);
+  assert.match(String(res2.error), /超时|总运行时限/);
+  assert.match(String(res2.error), /未能确认.*停止/);
+});
+
+test('审查通过提交后先持久化 completed 状态，再执行 push 并持久化推送结果', async t => {
+  const saves: { status: Task['status']; commit?: string; pushed?: boolean; pushError?: string }[] = [];
+  class RecordingStore extends Store {
+    override async save(task: Task): Promise<void> {
+      saves.push({ status: task.status, commit: task.commit, pushed: Boolean(task.pushed), pushError: task.pushError });
+      await super.save(task);
+    }
+  }
+  const { engine, handoff, repo } = await fixture(
+    t,
+    async params => { await writeFile(path.join(params.cwd, 'value.txt'), 'done\n'); },
+    undefined,
+    undefined,
+    { store: dataDir => new RecordingStore(dataDir) },
+  );
+  await bareRemote(repo);
+  const orphan = await git(repo, ['commit-tree', 'HEAD^{tree}', '-m', 'test: unrelated history']);
+  await git(repo, ['push', 'origin', `${orphan}:refs/heads/main`]);
+  const task = await engine.submit({ operation: 'execute', handoff: { ...handoff, push: { remote: 'origin', branch: 'main' } } });
+  const result = await engine.wait(task.id, 60_000);
+  assert.equal(result.status, 'awaiting_review');
+  saves.length = 0;
+  const completed = await engine.submit({ operation: 'review', taskId: task.id, fingerprint: result.fingerprint, review: { verdict: 'approved', summary: '代码与验收符合方案。', issues: [] } });
+  assert.equal(completed.status, 'completed');
+  const completedSaves = saves.filter(item => item.status === 'completed');
+  assert.ok(completedSaves.length >= 2, `期望在 push 前后各保存一次 completed，实际保存次数：${completedSaves.length}`);
+  assert.equal(completedSaves[0].commit, completed.commit);
+  assert.equal(completedSaves[0].pushed, false);
+  assert.equal(completedSaves[0].pushError, undefined);
+  assert.match(String(completedSaves.at(-1)?.pushError), /推送失败/);
+});
+
+test('awaiting_review 后手动修改工作区文件，wait_task 自动重新验收并更新指纹', async t => {
+  const { engine, handoff } = await fixture(t, async params => { await writeFile(path.join(params.cwd, 'value.txt'), 'first\n'); });
+  const task = await engine.submit({ operation: 'execute', handoff });
+  const first = await engine.wait(task.id, 60_000);
+  assert.equal(first.status, 'awaiting_review');
+
+  await writeFile(path.join(task.worktree!, 'value.txt'), 'manual edit\n');
+  await assert.rejects(engine.submit({ operation: 'review', taskId: task.id, fingerprint: first.fingerprint, review: { verdict: 'approved', summary: '旧指纹应被拒绝。', issues: [] } }), /指纹不符/);
+
+  const refreshed = await engine.wait(task.id, 60_000);
+  assert.equal(refreshed.status, 'awaiting_review');
+  assert.notEqual(refreshed.fingerprint, first.fingerprint);
+  const completed = await engine.submit({ operation: 'review', taskId: task.id, fingerprint: refreshed.fingerprint, review: { verdict: 'approved', summary: '新指纹通过。', issues: [] } });
+  assert.equal(completed.status, 'completed');
+  assert.equal(await readFile(path.join(completed.worktree!, 'value.txt'), 'utf8'), 'manual edit\n');
+});
+
+test('同时修改已跟踪文件和新增未跟踪文件时 changes.diff 每个 diff --git 都在行首', async t => {
+  const { engine, handoff } = await fixture(t, async params => {
+    await writeFile(path.join(params.cwd, 'baseline.txt'), 'baseline\nmodified\n');
+    await writeFile(path.join(params.cwd, 'value.txt'), 'brand new\n');
+  });
+  const task = await engine.submit({ operation: 'execute', handoff: { ...handoff, allowedPaths: ['baseline.txt', 'value.txt'] } });
+  const result = await engine.wait(task.id, 60_000);
+  assert.equal(result.status, 'awaiting_review');
+  const diff = await readFile(String(result.diffPath), 'utf8');
+  const allHeaders = diff.match(/diff --git /g) ?? [];
+  const lineStartHeaders = diff.match(/(?:^|\n)diff --git /g) ?? [];
+  assert.equal(allHeaders.length, 2, diff);
+  assert.equal(lineStartHeaders.length, 2, diff);
 });
