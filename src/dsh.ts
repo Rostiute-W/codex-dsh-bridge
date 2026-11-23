@@ -23,9 +23,12 @@ export interface NativeState {
 export interface Send {
   taskId: string; cwd: string; title: string; prompt: string; requestId: string; model?: Model;
 }
+export interface SendOptions {
+  signal?: AbortSignal; timeoutMs?: number;
+}
 export interface DshClient {
   models(): Promise<ModelCatalog>;
-  send(params: Send): Promise<{ sessionId: string; beforeSeq: number }>;
+  send(params: Send, options?: SendOptions): Promise<{ sessionId: string; beforeSeq: number }>;
   inspect(taskId: string): Promise<NativeState>;
   cancel(taskId: string): Promise<unknown>;
 }
@@ -48,19 +51,28 @@ export function validateModel(selection: Model, catalog: ModelCatalog): void {
   if (selection.reasoningEffort && !model.reasoning?.efforts.some(effort => effort.id === selection.reasoningEffort)) throw new Error('所选模型不支持此推理强度。');
 }
 
-function request(method: string, params: unknown): Promise<unknown> {
+const defaultTimeoutMs = 15_000;
+const sendTimeoutMs = 120_000;
+
+function request(method: string, params: unknown, options: SendOptions = {}): Promise<unknown> {
+  const timeoutMs = options.timeoutMs ?? defaultTimeoutMs;
+  const signal = options.signal;
+  if (signal?.aborted) return Promise.reject(new Error('DSH 管道请求已取消。'));
   const normalizedHome = path.normalize(dshHome).toLowerCase();
   const name = createHash('sha256').update(os.userInfo().username + normalizedHome).digest('hex').slice(0, 24);
   return new Promise((resolve, reject) => {
     const socket = net.connect(`\\\\.\\pipe\\codex-dsh-${name}`);
     const id = randomUUID();
     let data = '', size = 0, settled = false;
+    const onAbort = () => finish(new Error('DSH 管道请求已取消。'));
     const finish = (error?: unknown, result?: unknown) => {
       if (settled) return;
-      settled = true; clearTimeout(timer); socket.destroy();
+      settled = true; clearTimeout(timer); signal?.removeEventListener('abort', onAbort); socket.destroy();
       if (error) reject(error); else resolve(result);
     };
-    const timer = setTimeout(() => finish(new Error('DSH 管道请求超过 15 秒，现场已保留。')), 15_000);
+    const timer = setTimeout(() => finish(new Error(`DSH 管道请求超过 ${Math.round(timeoutMs / 1000)} 秒，现场已保留。`)), timeoutMs);
+    signal?.addEventListener('abort', onAbort, { once: true });
+    if (signal?.aborted) { onAbort(); return; }
     socket.setEncoding('utf8');
     socket.once('connect', () => socket.write(JSON.stringify({ id, method, params }) + '\n'));
     socket.on('data', (chunk: string) => {
@@ -101,17 +113,21 @@ async function ensureConnection(): Promise<void> {
   await startup;
 }
 
-async function nativeRequest(method: string, params: unknown): Promise<unknown> {
-  try { return await request(method, params); }
+async function nativeRequest(method: string, params: unknown, options: SendOptions = {}): Promise<unknown> {
+  try { return await request(method, params, options); }
   catch (error) { if (!missingPipe(error)) throw error; }
+  if (options.signal?.aborted) throw new Error('DSH 管道请求已取消。');
   // 只有尚未建立连接时才启动 DSH；已发出的请求超时不能自动重发。
   await ensureConnection();
-  return request(method, params);
+  return request(method, params, options);
 }
 
 export const dsh: DshClient = {
   async models() { return await nativeRequest('models', {}) as ModelCatalog; },
-  async send(params) { return await nativeRequest('send', params) as { sessionId: string; beforeSeq: number }; },
+  async send(params, options) {
+    const timeoutMs = options?.timeoutMs === undefined ? sendTimeoutMs : Math.max(1, Math.min(sendTimeoutMs, options.timeoutMs));
+    return await nativeRequest('send', params, { signal: options?.signal, timeoutMs }) as { sessionId: string; beforeSeq: number };
+  },
   async inspect(taskId) { return await nativeRequest('inspect', { taskId }) as NativeState; },
   async cancel(taskId) { return nativeRequest('cancel', { taskId }); },
 };

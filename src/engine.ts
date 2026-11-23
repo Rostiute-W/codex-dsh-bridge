@@ -46,8 +46,12 @@ export interface Task {
   pushed?: { remote: string; branch: string; commit: string; remoteCommit: string; output: string; at: string }; pushError?: string;
 }
 export function redact(text: string): string {
-  return text.replace(/\b(?:sk|ds)[-_][a-zA-Z0-9_-]{16,}\b/g, '[已隐藏凭据]')
-    .replace(/((?:api[_-]?key|access[_-]?token|authorization)\s*[:=]\s*)([^\s,;]+)/gi, '$1[已隐藏凭据]');
+  return text
+    .replace(/\b(?:sk|ds)[-_][a-zA-Z0-9_-]{16,}\b/g, '[已隐藏凭据]')
+    .replace(
+      /((?:api[_-]?key|access[_-]?token|authorization)(?:\\?["'])?\s*[:=]\s*)(?:(\\["'])(?:(?!\2)[^\r\n])+|(["'])(?:\\[^\r\n]|(?!\3)[^\r\n])+|(?![\\"'])(?:Digest[ \t]+[^\r\n']+|(?:Bearer|Basic|Token|OAuth|ApiKey|Api-Key|DPoP|Negotiate|AWS4-HMAC-SHA256|Bot|Key)[ \t]+(?:(?!\\["'])[^\r\n"'])+|[^\s,;'"&}\])<>]+))/gi,
+      (_match, prefix: string, escapedQuote?: string, quote?: string) => `${prefix}${escapedQuote ?? quote ?? ''}[已隐藏凭据]`,
+    );
 }
 export function safeError(error: unknown): string {
   return redact(error instanceof Error ? error.message : String(error)).slice(0, 4000);
@@ -109,6 +113,9 @@ export class Engine {
             delete task.error;
           } catch (error) { task.status = 'needs_attention'; task.error = safeError(error); }
           if (task.status === 'completed' && task.handoff.push) {
+            // 提交已落盘，推送前先持久化 completed 与未确认提示，避免推送中断后误报为 done。
+            task.pushError = '提交已完成，但推送尚未完成或中途中断，结果未确认；请核实远程分支后用 submit_task operation: push 非强制重推。';
+            await this.store.save(task);
             try {
               const pushed = await pushCommit(task.worktree!, task.commit!, task.handoff.push);
               task.pushed = { ...task.handoff.push, commit: task.commit!, remoteCommit: pushed.remoteCommit, output: redact(pushed.output), at: new Date().toISOString() };
@@ -188,7 +195,7 @@ export class Engine {
     ].join('\n');
   }
 
-  private async send(task: Task, prompt: string, persist = () => this.store.save(task)): Promise<void> {
+  private async send(task: Task, prompt: string, persist = () => this.store.save(task), signal?: AbortSignal): Promise<void> {
     const model = parseModel(task.model ?? '');
     if (model) validateModel(model, await this.client.models());
     // 先持久化运行状态，响应丢失时接管者只观察原会话，不自动重发提示词。
@@ -198,7 +205,10 @@ export class Engine {
     task.checks = [];
     await persist();
     const requestId = task.id + '-' + createHash('sha256').update(`${task.round}\n${prompt}`).digest('hex');
-    const started = await this.client.send({ taskId: task.id, cwd: task.worktree!, title: task.handoff.title, prompt, requestId, model });
+    const started = await this.client.send(
+      { taskId: task.id, cwd: task.worktree!, title: task.handoff.title, prompt, requestId, model },
+      { signal, timeoutMs: Math.min(120_000, Math.max(1, task.deadline - Date.now())) },
+    );
     task.sessionId = started.sessionId; task.beforeSeq = started.beforeSeq;
     await persist();
   }
@@ -236,12 +246,18 @@ export class Engine {
       const task = await this.task(id);
       if (task.status === 'awaiting_review') {
         const state = await this.client.inspect(id);
-        if (state.cursor === task.cursor && state.status === 'idle' && !state.pending) return;
-        this.observe(task, state);
-        task.beforeSeq = task.cursor ?? -1;
-        task.cursor = state.cursor;
-        task.status = state.status === 'idle' && !state.pending ? 'validating' : 'running';
-        if (task.status === 'validating') { delete task.blocked; delete task.stalledSince; }
+        if (state.cursor === task.cursor && state.status === 'idle' && !state.pending) {
+          const current = await snapshot(task);
+          if (current.fingerprint === task.fingerprint) return;
+          task.status = 'validating';
+          delete task.blocked; delete task.stalledSince;
+        } else {
+          this.observe(task, state);
+          task.beforeSeq = task.cursor ?? -1;
+          task.cursor = state.cursor;
+          task.status = state.status === 'idle' && !state.pending ? 'validating' : 'running';
+          if (task.status === 'validating') { delete task.blocked; delete task.stalledSince; }
+        }
         delete task.fingerprint; delete task.review; delete task.reviewedFingerprint;
         await this.store.save(task);
       }
@@ -307,7 +323,7 @@ export class Engine {
         } else {
           task.round++;
           await persist();
-          await this.send(task, '修复以下真实验收失败，保持原方案与 allowedPaths，不暂存、不提交：\n' + JSON.stringify(task.checks.filter(check => check.exitCode !== 0)), persist);
+          await this.send(task, '修复以下真实验收失败，保持原方案与 allowedPaths，不暂存、不提交：\n' + JSON.stringify(task.checks.filter(check => check.exitCode !== 0)), persist, controller.signal);
           lastCursor = undefined; lastCursorAt = Date.now();
           continue;
         }
@@ -316,40 +332,64 @@ export class Engine {
     } catch (error) {
       if (controller.signal.reason === 'cancelled' || (await this.task(task.id)).status === 'cancelled') return;
       task.status = 'needs_attention';
-      task.error = controller.signal.reason === 'timeout' ? '任务超过总运行时限，现场已保留。' : safeError(error);
-      await this.store.save(task);
+      if (controller.signal.reason === 'timeout' || remaining <= 0) {
+        const pendingError = '任务超过总运行时限，现场已保留（正在通知 DSH 停止当前轮次）。';
+        task.error = pendingError;
+        await this.store.save(task);
+        let finalError: string;
+        try {
+          await this.client.cancel(task.id);
+          finalError = '任务超过总运行时限，现场已保留（已确认通知 DSH 停止当前轮次）。';
+        } catch (cancelError) {
+          finalError = `任务超过总运行时限，现场已保留（未能确认 DSH 原生会话已停止：${safeError(cancelError)}）。`;
+        }
+        const latest = await this.task(task.id);
+        if (latest.status !== 'needs_attention' || latest.error !== pendingError) return;
+        task.error = finalError;
+        await this.store.save(task);
+      } else {
+        task.error = safeError(error);
+        await this.store.save(task);
+      }
     } finally { clearTimeout(timer); }
   }
 
   private async validate(task: Task, signal: AbortSignal, persist: () => Promise<void>): Promise<boolean> {
     await this.idle(task);
-    task.checks = [];
-    const before = await snapshot(task);
-    assertScope(task, before.files);
-    if (!before.files.length) throw new Error('执行者没有产生可审查的代码修改。');
     let pwsh: string | undefined;
-    for (const directory of (process.env.PATH ?? '').split(path.delimiter)) {
-      const candidate = path.join(directory.replace(/^"|"$/g, ''), process.platform === 'win32' ? 'pwsh.exe' : 'pwsh');
-      try { await access(candidate); pwsh = candidate; break; } catch { /* 继续查找 PATH。 */ }
+    for (let attempt = 0; attempt < 2; attempt++) {
+      task.checks = [];
+      const before = await snapshot(task);
+      assertScope(task, before.files);
+      if (!before.files.length) throw new Error('执行者没有产生可审查的代码修改。');
+      if (!pwsh) {
+        for (const directory of (process.env.PATH ?? '').split(path.delimiter)) {
+          const candidate = path.join(directory.replace(/^"|"$/g, ''), process.platform === 'win32' ? 'pwsh.exe' : 'pwsh');
+          try { await access(candidate); pwsh = candidate; break; } catch { /* 继续查找 PATH。 */ }
+        }
+        if (!pwsh) throw new Error('验收需要 PowerShell 7（pwsh），请安装并加入 PATH，不会回退到 PowerShell 5.1。');
+      }
+      for (const command of task.handoff.validationCommands) {
+        if (/\bgit\s+(push|reset|clean|restore|checkout|switch|commit|add|rebase|merge)\b/i.test(command)) throw new Error('验收命令包含 Git 修改或远程操作，已停止。');
+        const script = `$ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue'; [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false); $OutputEncoding = [Console]::OutputEncoding; $global:LASTEXITCODE = 0;\n${command}\nif ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }`;
+        const result = await runProcess(pwsh, ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')], {
+          cwd: task.worktree, env: cleanEnvironment(), signal, timeoutMs: Math.max(1, task.deadline - Date.now()),
+        });
+        task.checks.push({ command, exitCode: result.code, output: redact(result.output).slice(-16000), at: new Date().toISOString() });
+        await persist();
+      }
+      const after = await snapshot(task);
+      assertScope(task, after.files);
+      if (!after.files.length) throw new Error('验收后没有可审查的代码修改。');
+      await this.idle(task);
+      if (after.fingerprint === before.fingerprint) {
+        task.changedFiles = after.files; task.fingerprint = after.fingerprint;
+        task.diffPath = path.join(this.store.taskDir(task.id), 'changes.diff');
+        await writeFile(task.diffPath, redact(after.diff), 'utf8');
+        return task.checks.every(check => check.exitCode === 0);
+      }
     }
-    if (!pwsh) throw new Error('验收需要 PowerShell 7（pwsh），请安装并加入 PATH，不会回退到 PowerShell 5.1。');
-    for (const command of task.handoff.validationCommands) {
-      if (/\bgit\s+(push|reset|clean|restore|checkout|switch|commit|add|rebase|merge)\b/i.test(command)) throw new Error('验收命令包含 Git 修改或远程操作，已停止。');
-      const script = `$ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue'; [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false); $OutputEncoding = [Console]::OutputEncoding; $global:LASTEXITCODE = 0;\n${command}\nif ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }`;
-      const result = await runProcess(pwsh, ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')], {
-        cwd: task.worktree, env: cleanEnvironment(), signal, timeoutMs: Math.max(1, task.deadline - Date.now()),
-      });
-      task.checks.push({ command, exitCode: result.code, output: redact(result.output).slice(-16000), at: new Date().toISOString() });
-      await persist();
-    }
-    const after = await snapshot(task);
-    assertScope(task, after.files);
-    if (!after.files.length) throw new Error('验收后没有可审查的代码修改。');
-    await this.idle(task);
-    task.changedFiles = after.files; task.fingerprint = after.fingerprint;
-    task.diffPath = path.join(this.store.taskDir(task.id), 'changes.diff');
-    await writeFile(task.diffPath, redact(after.diff), 'utf8');
-    return task.checks.every(check => check.exitCode === 0);
+    throw new Error('验收命令修改了工作区文件且重跑后仍发生变化，验收命令不得修改工作区。');
   }
 
   async wait(id: string, timeoutMs = 600_000): Promise<Record<string, unknown>> {
@@ -398,9 +438,14 @@ export class Engine {
     try {
       if (task.status === 'completed' || task.status === 'cancelled') return task;
       this.drivers.get(id)?.controller.abort('cancelled');
-      try { await this.client.cancel(id); }
-      catch (error) { task.error = safeError(error); }
-      task.status = 'cancelled';
+      try {
+        await this.client.cancel(id);
+        task.status = 'cancelled';
+        delete task.error;
+      } catch (error) {
+        task.status = 'needs_attention';
+        task.error = `未能确认 DSH 原生会话已取消，DSH 可能仍在编辑工作区：${safeError(error)}`;
+      }
       await this.store.save(task);
       return task;
     } finally { await release?.(); }

@@ -95,6 +95,28 @@ async function installDshPlugin(selectedDsh: string): Promise<void> {
   }
 }
 
+function extractCodexEnv(sectionText: string, envSectionText: string): Record<string, string> {
+  const result: Record<string, string> = {};
+  const parseEntries = (text: string) => {
+    const pattern = /([A-Za-z_][A-Za-z0-9_-]*)\s*=\s*(?:"((?:\\.|[^"\\])*)"|'([^']*)')/g;
+    for (const match of text.matchAll(pattern)) {
+      const [, key, basic, literal] = match;
+      if (literal !== undefined) result[key] = literal;
+      else if (basic !== undefined) {
+        try { result[key] = JSON.parse(`"${basic}"`) as string; }
+        catch { result[key] = basic; }
+      }
+    }
+  };
+  const inline = /^env\s*=\s*\{((?:[^"'{}]|"(?:\\.|[^"\\])*"|'[^']*')*)\}/m.exec(sectionText);
+  if (inline) parseEntries(inline[1]);
+  if (envSectionText) {
+    const body = envSectionText.replace(/^\[[^\r\n]*\]\r?\n?/, '').replace(/^[ \t]*#[^\r\n]*$/gm, '');
+    parseEntries(body);
+  }
+  return result;
+}
+
 async function installCodexMcp(selectedDsh: string, mcpPath: string): Promise<void> {
   const codexHome = process.env.CODEX_HOME ?? path.join(os.homedir(), '.codex');
   const configPath = path.join(codexHome, 'config.toml');
@@ -103,8 +125,20 @@ async function installCodexMcp(selectedDsh: string, mcpPath: string): Promise<vo
   catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
   const section = /(^\[mcp_servers\.codex-dsh-bridge\]\r?\n)([\s\S]*?)(?=^\[|$(?![\s\S]))/m;
   const existingSection = section.exec(original ?? '')?.[0];
-  // TOML 基本字符串会转义反斜杠，字面量字符串则保留原路径。
-  if (existingSection?.includes(mcpPath) || existingSection?.includes(mcpPath.replace(/\\/g, '\\\\'))) {
+  const envSection = /(^\[mcp_servers\.codex-dsh-bridge\.env\]\r?\n)([\s\S]*?)(?=^\[|$(?![\s\S]))/m.exec(original ?? '')?.[0] ?? '';
+  const hasTomlString = (text: string, value: string) =>
+    text.includes(JSON.stringify(value)) || text.includes(`'${value}'`);
+  const existingEnv = extractCodexEnv(existingSection ?? '', envSection);
+  const hasDshHome = Boolean(process.env.DSH_HOME?.trim());
+  const dshHomeMatches = hasDshHome ? existingEnv.DSH_HOME === dshHome : !Object.hasOwn(existingEnv, 'DSH_HOME');
+  // TOML 基本字符串会转义反斜杠，字面量字符串则保留原路径；需同时核对入口、环境变量和超时。
+  if (
+    existingSection !== undefined
+    && hasTomlString(existingSection, mcpPath)
+    && existingEnv.DSH_PATH === selectedDsh
+    && dshHomeMatches
+    && /^tool_timeout_sec\s*=\s*660[ \t]*(?:#[^\r\n]*)?\r?$/m.test(existingSection)
+  ) {
     console.log('MCP 已指向当前入口，跳过。');
     return;
   }
@@ -116,7 +150,11 @@ async function installCodexMcp(selectedDsh: string, mcpPath: string): Promise<vo
     if (result.code !== 0) throw new Error('旧 Codex MCP 注册移除失败：' + safeError(result.output).slice(-1500));
   }
   const args = ['mcp', 'add', 'codex-dsh-bridge', '--env', `DSH_PATH=${selectedDsh}`];
-  if (process.env.DSH_HOME?.trim()) args.push('--env', `DSH_HOME=${dshHome}`);
+  if (hasDshHome) args.push('--env', `DSH_HOME=${dshHome}`);
+  for (const [key, value] of Object.entries(existingEnv)) {
+    if (key === 'DSH_PATH' || key === 'DSH_HOME') continue;
+    args.push('--env', `${key}=${value}`);
+  }
   args.push('--', process.execPath, mcpPath);
   const result = await runProcess(command, args, { env: codexEnv });
   if (result.code !== 0) throw new Error('Codex MCP 注册失败：' + safeError(result.output).slice(-1500));

@@ -304,3 +304,56 @@ test('Antigravity 拒绝含 BOM、注释或非法结构的 mcp_config.json 且�
     assert.equal(backups.length, 0);
   }
 });
+
+test('Codex 重复安装校验 DSH_PATH、DSH_HOME 与 tool_timeout_sec，变更时重新注册', async t => {
+  const { tempRoot, dshCmd, dshHomeDir, codexHomeDir, callLog, runInstall } = await setupFixture(t, { withCodex: true });
+  const codexConfig = path.join(codexHomeDir, 'config.toml');
+  const helperPath = path.join(tempRoot, 'fake-helper.mjs');
+  const dshDir2 = path.join(tempRoot, 'DSH App 2');
+  await mkdir(dshDir2, { recursive: true });
+  const dshCmd2 = path.join(dshDir2, 'dsh.cmd');
+  await writeFile(dshCmd2, `@echo off\r\n"${process.execPath}" "${helperPath}" dsh %*\r\n`, 'utf8');
+
+  const first = await runInstall(['--dsh', dshCmd], { CODEX_HOME: codexHomeDir, DSH_HOME: dshHomeDir });
+  assert.equal(first.code, 0, first.output);
+  const callsAfterFirst = (await readFile(callLog, 'utf8')).trim().split(/\r?\n/).length;
+
+  // 参数一致时应跳过。
+  const same = await runInstall(['--dsh', dshCmd], { CODEX_HOME: codexHomeDir, DSH_HOME: dshHomeDir });
+  assert.equal(same.code, 0, same.output);
+  assert.match(same.output, /MCP 已指向当前入口，跳过/);
+  assert.equal((await readFile(callLog, 'utf8')).trim().split(/\r?\n/).length, callsAfterFirst);
+
+  // 更换 --dsh 时必须重新注册并更新 DSH_PATH。
+  const changedDsh = await runInstall(['--dsh', dshCmd2], { CODEX_HOME: codexHomeDir, DSH_HOME: dshHomeDir });
+  assert.equal(changedDsh.code, 0, changedDsh.output);
+  const afterDsh2 = await readFile(codexConfig, 'utf8');
+  assert.ok(afterDsh2.includes(dshCmd2) || afterDsh2.includes(dshCmd2.replace(/\\/g, '\\\\')));
+  assert.match(afterDsh2, /^tool_timeout_sec = 660$/m);
+
+  // 缺失 tool_timeout_sec = 660 时不能跳过。
+  await writeFile(codexConfig, afterDsh2.replace(/^tool_timeout_sec\s*=.*\r?\n/gm, ''), 'utf8');
+  const restoredTimeout = await runInstall(['--dsh', dshCmd2], { CODEX_HOME: codexHomeDir, DSH_HOME: dshHomeDir });
+  assert.equal(restoredTimeout.code, 0, restoredTimeout.output);
+  assert.match(await readFile(codexConfig, 'utf8'), /^tool_timeout_sec = 660$/m);
+
+  // 更换 DSH_HOME 时不能跳过。
+  const dshHomeDir2 = path.join(tempRoot, 'DSH Home 2');
+  const changedHome = await runInstall(['--dsh', dshCmd2], { CODEX_HOME: codexHomeDir, DSH_HOME: dshHomeDir2 });
+  assert.equal(changedHome.code, 0, changedHome.output);
+  const afterHome2 = await readFile(codexConfig, 'utf8');
+  assert.ok(afterHome2.includes(dshHomeDir2) || afterHome2.includes(dshHomeDir2.replace(/\\/g, '\\\\')));
+
+  // 重新注册时必须保留用户手工写入的 DSH_MODEL、BRIDGE_TIMEOUT_MINUTES 等非托管 env 键。
+  await writeFile(
+    codexConfig,
+    afterHome2.replace(/env = \{ ([^}]+) \}/, "env = { $1, DSH_MODEL = 'magpie/custom-model', BRIDGE_TIMEOUT_MINUTES = '180' }"),
+    'utf8',
+  );
+  const preserved = await runInstall(['--dsh', dshCmd], { CODEX_HOME: codexHomeDir, DSH_HOME: dshHomeDir2 });
+  assert.equal(preserved.code, 0, preserved.output);
+  const afterPreserved = await readFile(codexConfig, 'utf8');
+  assert.ok(afterPreserved.includes(dshCmd) || afterPreserved.includes(dshCmd.replace(/\\/g, '\\\\')));
+  assert.match(afterPreserved, /DSH_MODEL\s*=\s*["']magpie\/custom-model["']/);
+  assert.match(afterPreserved, /BRIDGE_TIMEOUT_MINUTES\s*=\s*["']180["']/);
+});
